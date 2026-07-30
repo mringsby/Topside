@@ -2,8 +2,8 @@
 
 The Flask template was minimal: a heading and a bare `<img src="{{ url_for('video_feed') }}">`
 with no companion JS, so there was no client-side status polling for this page. `video_feed`
-served `hub.default_camera` (see `lib/camera.py::generate_frames` / PARITY.md §3), a local capture
-device — not an ROV camera — so it is expected to show "no signal" on a machine with no webcam.
+served `hub.default_camera` (PARITY.md §3), a local capture device — not an ROV camera — so it is
+expected to show "no signal" on a machine with no webcam.
 
 The video itself is `widgets/camera.py::CameraWidget`, reading `hub.default_camera` directly
 instead of going over HTTP multipart. A small LIVE/OFFLINE badge is added on top of the original
