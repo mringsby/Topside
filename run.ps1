@@ -59,7 +59,7 @@ function Start-AppInNewTerminal {
     $escapedRoot = $RootDir.Replace("'", "''")
     $python = Join-Path $RootDir ".venv\Scripts\python.exe"
     $escapedPython = $python.Replace("'", "''")
-    $command = "Set-Location -LiteralPath '$escapedRoot'; & '$escapedPython' app.py"
+    $command = "Set-Location -LiteralPath '$escapedRoot'; & '$escapedPython' -m desktop"
 
     Start-Process $shell -ArgumentList @(
         "-NoExit",
@@ -75,5 +75,5 @@ Ensure-Environment
 if ($NewTerminal) {
     Start-AppInNewTerminal
 } else {
-    & ".venv\Scripts\python.exe" app.py
+    & ".venv\Scripts\python.exe" -m desktop
 }

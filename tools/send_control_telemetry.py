@@ -6,7 +6,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from lib.crc import crc32_ieee
+from lib.crc import crc32_ieee  # noqa: E402 - needs the sys.path insert above to resolve
 
 AXES = ["surge", "sway", "heave", "roll", "pitch", "yaw"]
 PORT = 5005

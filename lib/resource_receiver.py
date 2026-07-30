@@ -92,9 +92,7 @@ class ResourceReceiver:
         """Get receiver statistics."""
         with self._lock:
             age_ms = (
-                None
-                if self._last_received_ts is None
-                else max(0.0, (time.time() - self._last_received_ts) * 1000.0)
+                None if self._last_received_ts is None else max(0.0, (time.time() - self._last_received_ts) * 1000.0)
             )
             return {
                 "packet_count": self._packet_count,

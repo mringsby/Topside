@@ -5,6 +5,18 @@ data/data.json
 debug_server/server_logs/*
 agent.md
 
+# graphify knowledge graph — generated (~5 MB), rebuilt with `graphify update .`
+graphify-out/
+
+# Local Claude Code config. Not shared: `graphify claude install` writes hooks
+# containing an absolute path to that machine's graphify binary, which would fire
+# and fail for every other contributor. Run `graphify install --project` and
+# `graphify claude install` yourself to set it up locally.
+.claude/
+
+# Terminal scrollback dumps
+backup.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

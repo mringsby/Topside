@@ -17,10 +17,9 @@ Get the latest release from the [Releases page](../../releases).
 2. Windows SmartScreen will likely show **"Windows protected your PC"**. Click **More info → Run anyway**. The installer is not code-signed; this is expected.
 3. On the installer task page, select **Configure MCU Ethernet adapter to 10.77.0.1/24** if this PC is connected directly to the MCU network. Windows will ask for administrator approval for this step.
 4. After install, launch **Topside** from the Start Menu.
-5. A console window appears and the dashboard server starts on port 5000.
-6. Open a web browser and go to <http://localhost:5000>.
+5. The Topside window opens. A console window appears alongside it carrying startup and receiver logs.
 
-To stop the app, close the console window.
+To stop the app, close the Topside window.
 
 ## Network Setup
 

@@ -3,7 +3,7 @@
 **Run from source**
 ```bash
 uv sync --frozen
-uv run python app.py
+uv run python -m desktop
 ```
 
 **One-command launch**

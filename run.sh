@@ -107,7 +107,7 @@ launch_in_new_terminal() {
     local quoted_python
     printf -v quoted_root "%q" "$ROOT_DIR"
     printf -v quoted_python "%q" "${ROOT_DIR}/.venv/bin/python"
-    local command="cd ${quoted_root} && ${quoted_python} app.py"
+    local command="cd ${quoted_root} && ${quoted_python} -m desktop"
 
     if command_exists gnome-terminal; then
         gnome-terminal -- bash -lc "${command}; exec bash"
@@ -117,7 +117,7 @@ launch_in_new_terminal() {
         xterm -e bash -lc "${command}; exec bash"
     else
         echo "No supported terminal emulator found; running in this terminal instead."
-        "${ROOT_DIR}/.venv/bin/python" app.py
+        "${ROOT_DIR}/.venv/bin/python" -m desktop
     fi
 }
 
@@ -126,5 +126,5 @@ ensure_environment
 if [[ "${1:-}" == "--new-terminal" ]]; then
     launch_in_new_terminal
 else
-    "${ROOT_DIR}/.venv/bin/python" app.py
+    "${ROOT_DIR}/.venv/bin/python" -m desktop
 fi

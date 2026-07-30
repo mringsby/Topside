@@ -196,20 +196,6 @@ class DefaultCameraReceiver:
         self._release_cap()
 
 
-def generate_frames(camera):
-    """Flask MJPEG generator for the default camera receiver."""
-    last_seq = -1
-    while True:
-        frame, seq = camera.wait_for_next_frame(last_seq, timeout=0.25)
-        if frame is None:
-            frame = camera.get_placeholder_jpeg()
-        elif seq == last_seq:
-            continue
-
-        last_seq = seq
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-
-
 def init_camera(device_index=0, jpeg_quality=70, marker_logger=None):
     """Initialize and start the default local camera receiver."""
     receiver = DefaultCameraReceiver(device_index=device_index, jpeg_quality=jpeg_quality, marker_logger=marker_logger)
@@ -590,22 +576,6 @@ def init_rpi_camera(
     return receiver
 
 
-def generate_rpi_frames(rpi_camera):
-    """Flask MJPEG generator for latest frame from the RPi camera receiver."""
-    last_seq = -1
-    while True:
-        frame, seq = rpi_camera.wait_for_next_frame(last_seq, timeout=0.25)
-        if frame is None:
-            frame = rpi_camera.get_placeholder_jpeg()
-        elif seq == last_seq:
-            # no new frame yet
-            continue
-
-        last_seq = seq
-
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-
-
 class IPCameraReceiver:
     """Connects to an IP camera via RTSP and exposes latest JPEG frame.
 
@@ -801,16 +771,3 @@ def init_ip_camera(
     )
     receiver.start()
     return receiver
-
-
-def generate_ip_camera_frames(ip_camera):
-    """Flask MJPEG generator for the IP camera receiver."""
-    last_seq = -1
-    while True:
-        frame, seq = ip_camera.wait_for_next_frame(last_seq, timeout=0.25)
-        if frame is None:
-            frame = ip_camera.get_placeholder_jpeg()
-        elif seq == last_seq:
-            continue
-        last_seq = seq
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
