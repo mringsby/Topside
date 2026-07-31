@@ -12,6 +12,7 @@ from desktop.screens.debug import DebugScreen
 from desktop.screens.graphs import GraphsScreen
 from desktop.screens.home import HomeScreen
 from desktop.screens.ip_camera import IpCameraScreen
+from desktop.screens.logs import LogsScreen
 from desktop.screens.pid_tuning import PidTuningScreen
 from desktop.screens.pilot import PilotScreen
 from desktop.screens.tooling import ToolingScreen
@@ -26,10 +27,11 @@ SCREENS = [
     GraphsScreen,
     ConfigScreen,
     ConnectionScreen,
+    LogsScreen,
     IpCameraScreen,
     Camera1Screen,
 ]
 
-#: Was: screens awaiting a shard, rendered as disabled tabs. All ten are ported, so this is empty.
+#: Was: screens awaiting a shard, rendered as disabled tabs. Everything is ported, so this is empty.
 #: `main.py` still reads it — keep the hook rather than deleting it.
 PENDING = []

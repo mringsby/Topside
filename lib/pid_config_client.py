@@ -11,8 +11,8 @@ Both operations return a reply with the active gains.
 
 import socket
 import struct
-import zlib
 
+from lib.crc import crc32_ieee
 from lib.net_transport import DEFAULT_ROV_HOST
 
 MCU_IP = DEFAULT_ROV_HOST
@@ -38,7 +38,7 @@ def _build_packet(pkt_type, gains):
         floats.extend([float(g["kp"]), float(g["ki"]), float(g["kd"])])
 
     header = struct.pack("<B18f", pkt_type, *floats)
-    crc = zlib.crc32(header) & 0xFFFFFFFF
+    crc = crc32_ieee(header)
     return header + struct.pack("<I", crc)
 
 
@@ -50,7 +50,7 @@ def _parse_packet(data):
     values = struct.unpack(PACKET_FORMAT, data)
     recv_crc = values[19]
 
-    calc_crc = zlib.crc32(data[:-4]) & 0xFFFFFFFF
+    calc_crc = crc32_ieee(data[:-4])
     if calc_crc != recv_crc:
         return None
 

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from desktop.screens.base import ScreenBase
+from desktop.widgets.sparkline import SparklineWidget
 
 POLL_INTERVAL_MS = 1000
 RESET_STATUS_RESET_MS = 3000
@@ -50,6 +51,7 @@ class ConnectionScreen(ScreenBase):
         layout = QVBoxLayout(self)
         layout.addWidget(self.notice_widget)
         layout.addWidget(self._build_proof_box())
+        layout.addWidget(self._build_resource_box())
 
         row = QHBoxLayout()
         row.addWidget(self._build_reset_box())
@@ -115,6 +117,8 @@ class ConnectionScreen(ScreenBase):
         imu_age = imu.get("age_ms")
         self._imu_age.setText("--" if imu_age is None else f"{round(imu_age)} ms")
 
+        self._render_resources(status.get("resource"))
+
         self._details.setPlainText(
             json.dumps({"uplink": uplink, "resource": status.get("resource"), "imu": imu}, indent=2)
         )
@@ -149,6 +153,142 @@ class ConnectionScreen(ScreenBase):
             age = proof.get("age_ms")
             table.setItem(row, 2, QTableWidgetItem("--" if age is None else f"{round(age)} ms"))
             table.setItem(row, 3, QTableWidgetItem(str(proof.get("detail") or "")))
+
+    # --- MCU resource telemetry --------------------------------------------------
+
+    def _build_resource_box(self):
+        """`hub.resource.get_stats()` (UDP 12346, ~1 Hz) fed through the same "connection.proof"
+        poll that already carries it in `status["resource"]` -- no second timer.
+
+        `udp_rx_errors` is not just a diagnostic: `SetpointOverrideClient._check_resource_health()`
+        (lib/setpoint_override.py) already refuses to send an override once this counter rises,
+        silently. Surfacing its trend here is what makes that failure visible instead of hidden.
+        """
+        box = QGroupBox("MCU Resource Telemetry")
+        self._resource_box = box
+        self._resource_badge = QLabel("--")
+        self._resource_badge.setStyleSheet(_BADGE_STYLES["secondary"])
+
+        header = QHBoxLayout()
+        header.addStretch(1)
+        header.addWidget(self._resource_badge)
+
+        self._cpu_value = QLabel("--")
+        self._heap_value = QLabel("--")
+        self._threads_value = QLabel("--")
+
+        stats = QGridLayout()
+        stats.addWidget(QLabel("CPU Load"), 0, 0)
+        stats.addWidget(QLabel("Heap Free/Total"), 0, 1)
+        stats.addWidget(QLabel("Threads"), 0, 2)
+        stats.addWidget(self._cpu_value, 1, 0)
+        stats.addWidget(self._heap_value, 1, 1)
+        stats.addWidget(self._threads_value, 1, 2)
+
+        self._rx_errors_value = QLabel("--")
+        self._rx_errors_spark = SparklineWidget(max_points=60)
+        self._crc_errors_value = QLabel("--")
+        self._crc_errors_spark = SparklineWidget(max_points=60)
+        self._packets_lost_value = QLabel("--")
+
+        errors = QGridLayout()
+        errors.addWidget(QLabel("UDP RX Errors"), 0, 0)
+        errors.addWidget(self._rx_errors_value, 0, 1)
+        errors.addWidget(self._rx_errors_spark, 0, 2)
+        errors.addWidget(QLabel("CRC Errors"), 1, 0)
+        errors.addWidget(self._crc_errors_value, 1, 1)
+        errors.addWidget(self._crc_errors_spark, 1, 2)
+        errors.addWidget(QLabel("Packets Lost"), 2, 0)
+        errors.addWidget(self._packets_lost_value, 2, 1)
+
+        outer = QVBoxLayout(box)
+        outer.addLayout(header)
+        outer.addLayout(stats)
+        outer.addLayout(errors)
+
+        self._last_rx_errors = None
+        self._last_crc_errors = None
+        self._render_resources(None)
+        return box
+
+    def _render_resources(self, resource):
+        if self.hub.resource is None:
+            self._resource_box.setEnabled(False)
+            self._resource_badge.setText("--")
+            self._resource_badge.setStyleSheet(_BADGE_STYLES["secondary"])
+            for label in (
+                self._cpu_value,
+                self._heap_value,
+                self._threads_value,
+                self._rx_errors_value,
+                self._crc_errors_value,
+                self._packets_lost_value,
+            ):
+                label.setText("--")
+            self._rx_errors_spark.clear()
+            self._crc_errors_spark.clear()
+            self._last_rx_errors = None
+            self._last_crc_errors = None
+            return
+
+        self._resource_box.setEnabled(True)
+        resource = resource or {}
+        last_data = resource.get("last_data") or {}
+
+        cpu = last_data.get("cpu_percent")
+        heap_free = last_data.get("heap_free_kb")
+        heap_total = last_data.get("heap_total_kb")
+        heap_used_pct = last_data.get("heap_used_percent")
+        threads = last_data.get("thread_count")
+        rx_errors = last_data.get("udp_rx_errors")
+
+        crc_errors = resource.get("crc_errors", 0)
+        packets_lost = resource.get("packets_lost", 0)
+
+        self._cpu_value.setText("--" if cpu is None else f"{cpu}%")
+        if heap_free is None or heap_total is None:
+            self._heap_value.setText("--")
+        else:
+            used = "" if heap_used_pct is None else f" ({heap_used_pct}% used)"
+            self._heap_value.setText(f"{heap_free}/{heap_total} KB{used}")
+        self._threads_value.setText("--" if threads is None else str(threads))
+        self._packets_lost_value.setText(str(packets_lost))
+
+        rx_rising = rx_errors is not None and self._last_rx_errors is not None and rx_errors > self._last_rx_errors
+        crc_rising = self._last_crc_errors is not None and crc_errors > self._last_crc_errors
+
+        self._rx_errors_value.setText("--" if rx_errors is None else str(rx_errors))
+        self._rx_errors_value.setStyleSheet(_BADGE_STYLES["danger"] if rx_rising else "")
+        self._crc_errors_value.setText(str(crc_errors))
+        self._crc_errors_value.setStyleSheet(_BADGE_STYLES["danger"] if crc_rising else "")
+
+        if rx_errors is not None:
+            self._rx_errors_spark.add_value(rx_errors)
+        self._rx_errors_spark.set_alert(rx_rising)
+        self._crc_errors_spark.add_value(crc_errors)
+        self._crc_errors_spark.set_alert(crc_rising)
+
+        # "OK" is reserved for a genuinely clean link. A counter that climbed and then plateaued
+        # is still a degraded link, and `rx_rising`/`crc_rising` only compare against the previous
+        # poll -- so without this middle state the badge would flash red for one 1 Hz tick and then
+        # sit on green "OK" next to a five-figure error count.
+        has_errors = bool(rx_errors) or bool(crc_errors) or bool(packets_lost)
+        if rx_rising or crc_rising:
+            self._resource_badge.setText("RISING")
+            self._resource_badge.setStyleSheet(_BADGE_STYLES["danger"])
+        elif resource.get("last_age_ms") is None:
+            self._resource_badge.setText("NO DATA")
+            self._resource_badge.setStyleSheet(_BADGE_STYLES["secondary"])
+        elif has_errors:
+            self._resource_badge.setText("ERRORS")
+            self._resource_badge.setStyleSheet(_BADGE_STYLES["warning"])
+        else:
+            self._resource_badge.setText("OK")
+            self._resource_badge.setStyleSheet(_BADGE_STYLES["success"])
+
+        if rx_errors is not None:
+            self._last_rx_errors = rx_errors
+        self._last_crc_errors = crc_errors
 
     # --- Restart MCU ------------------------------------------------------------
 

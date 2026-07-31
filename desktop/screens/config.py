@@ -30,6 +30,8 @@ from desktop.screens.base import ScreenBase
 
 STATUS_INTERVAL_MS = 1000
 GAIN_SAVE_DEBOUNCE_MS = 250
+#: How long to wait after send_full_axis_config() before checking the 9DOF stream is still alive.
+AXIS_PROBE_DELAY_MS = 750
 
 IMU_AXIS_OPTIONS = {
     "yaw": ["+yaw", "-yaw", "+pitch", "-pitch", "+roll", "-roll"],
@@ -335,7 +337,7 @@ class ConfigScreen(ScreenBase):
         except Exception as exc:
             self._axes_feedback.setText(f"Error: {exc}")
             return
-        self._axes_feedback.setText("Mapping saved")
+        self._start_axis_probe(self._axes_feedback, "Mapping saved")
 
     # --- Accelerometer axis mapping -----------------------------------------------
 
@@ -384,7 +386,7 @@ class ConfigScreen(ScreenBase):
         except Exception as exc:
             self._accel_feedback.setText(f"Error: {exc}")
             return
-        self._accel_feedback.setText("Accelerometer mapping saved")
+        self._start_axis_probe(self._accel_feedback, "Accelerometer mapping saved")
 
     # --- IMU offset from mass center -----------------------------------------------
 
@@ -428,7 +430,40 @@ class ConfigScreen(ScreenBase):
         except Exception as exc:
             self._offset_feedback.setText(f"Error: {exc}")
             return
-        self._offset_feedback.setText("Offset saved")
+        self._start_axis_probe(self._offset_feedback, "Offset saved")
+
+    # --- axis config liveness probe ------------------------------------------------
+
+    def _start_axis_probe(self, feedback_label, success_text):
+        """After a successful send_full_axis_config(), check the MCU is still alive.
+
+        UDP 5004 has no ACK: a dropped packet silently leaves the MCU on the old axis remap
+        while this screen says "sent". We CANNOT confirm the remap was applied correctly from
+        here -- that needs the vehicle physically moved. What we CAN check is liveness: sample
+        the 9DOF stream (UDP 5002) briefly and see if it is still producing fresh samples. That
+        catches the real failure modes -- MCU crashed, rebooted, or stopped publishing.
+        """
+        imu = self.hub.imu
+        if imu is None:
+            feedback_label.setText(f"{success_text} · sent (no IMU receiver available to check)")
+            return
+        baseline = imu.get_stats().get("packet_count") or 0
+        feedback_label.setText(f"{success_text} · sent, confirming IMU stream is alive...")
+        QTimer.singleShot(
+            AXIS_PROBE_DELAY_MS,
+            lambda: self._finish_axis_probe(feedback_label, success_text, imu, baseline),
+        )
+
+    def _finish_axis_probe(self, feedback_label, success_text, imu, baseline):
+        """Report liveness only -- never claim the axis remap itself was verified."""
+        stats = imu.get_stats()
+        count = stats.get("packet_count") or 0
+        if count > baseline:
+            feedback_label.setText(f"{success_text} · sent · IMU stream alive")
+        else:
+            message = f"{success_text} · sent · NO IMU DATA — config may not have applied"
+            feedback_label.setText(message)
+            self.notify(message)
 
     # --- lifecycle ----------------------------------------------------------
 

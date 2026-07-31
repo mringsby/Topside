@@ -21,6 +21,56 @@ def test_crc32_ieee_standard_vector():
     assert crc.crc32_ieee(b"123456789") == 0xCBF43926
 
 
+def test_axis_config_packet_bytes_are_pinned():
+    # Regression pin: axis_config_sender used to checksum with zlib.crc32
+    # directly; it now goes through crc.crc32_ieee (the same algorithm). This
+    # locks the exact on-wire bytes so a future change to either CRC path
+    # fails loudly instead of silently changing the packet.
+    pkt = axis_config_sender.build_axis_packet(
+        imu_axes={"yaw": "+yaw", "pitch": "-pitch", "roll": "+roll"},
+        accel_axes={"x": "+x", "y": "-y", "z": "+z"},
+        offset={"x": 1.5, "y": -2.5, "z": 0.25},
+    )
+    assert len(pkt) == 30
+    assert pkt.hex() == "01000001010200000001010200000000c03f000020c00000803e20154a3c"
+    assert pkt[-4:] == struct.pack("<I", crc.crc32_ieee(pkt[:-4]))
+
+
+def test_pid_config_packet_bytes_are_pinned():
+    # Regression pin: pid_config_client used to checksum with zlib.crc32
+    # directly; it now goes through crc.crc32_ieee (the same algorithm). This
+    # locks the exact on-wire bytes so a future change to either CRC path
+    # fails loudly instead of silently changing the packet.
+    gains = {
+        "surge": {"kp": 1.0, "ki": 0.1, "kd": 0.01},
+        "sway": {"kp": 2.0, "ki": 0.2, "kd": 0.02},
+        "heave": {"kp": 3.0, "ki": 0.3, "kd": 0.03},
+        "roll": {"kp": 4.0, "ki": 0.4, "kd": 0.04},
+        "pitch": {"kp": 5.0, "ki": 0.5, "kd": 0.05},
+        "yaw": {"kp": 6.0, "ki": 0.6, "kd": 0.06},
+    }
+    set_pkt = pid_config_client._build_packet(  # pylint: disable=protected-access
+        pid_config_client.PID_PKT_SET, gains
+    )
+    assert len(set_pkt) == 77
+    assert set_pkt.hex() == (
+        "010000803fcdcccc3d0ad7233c00000040cdcc4c3e0ad7a33c000040409a99993e8fc2f53c"
+        "00008040cdcccc3e0ad7233d0000a0400000003fcdcc4c3d0000c0409a99193f8fc2753df6e9d2f0"
+    )
+    assert set_pkt[-4:] == struct.pack("<I", crc.crc32_ieee(set_pkt[:-4]))
+
+    empty_gains = {axis: {"kp": 0.0, "ki": 0.0, "kd": 0.0} for axis in pid_config_client.AXES}
+    req_pkt = pid_config_client._build_packet(  # pylint: disable=protected-access
+        pid_config_client.PID_PKT_REQUEST, empty_gains
+    )
+    assert len(req_pkt) == 77
+    assert req_pkt.hex() == (
+        "0200000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        "0000000000000000000000000000000000000000000000000000000000000000b3a38163"
+    )
+    assert req_pkt[-4:] == struct.pack("<I", crc.crc32_ieee(req_pkt[:-4]))
+
+
 def test_bitmask_packet_big_endian():
     seq = 0x12345678
     payload = 0x0123456789ABCDEF

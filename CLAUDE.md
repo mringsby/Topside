@@ -102,10 +102,27 @@ in the thruster output and the stick input is integrated into attitude setpoints
 `hub.send_full_axis_config()`. The MCU takes remap and offset together in one packet; partial updates are
 a wire-protocol bug.
 
+**Port 5004 has no ACK, and Topside cannot verify a remap was applied.** A dropped packet silently
+leaves the MCU on the old axes. `config.py::_start_axis_probe` samples the 9DOF stream (5002) ~750 ms
+after each send and reports *liveness only* — it catches an MCU that crashed, rebooted, or stopped
+publishing. Confirming the remap itself is correct requires physically moving the vehicle. Never reword
+that feedback to say "verified"; it would be a lie to the operator.
+
+**`setpoint_override` refuses to transmit when UDP RX errors are rising.**
+`_check_resource_health()` raises rather than sending once `resource_receiver`'s counter climbs. That
+is why an override can appear to do nothing on a degraded link. Every call site must surface the
+refusal — `pid_tuning.py`'s kill/rearm/stop-PID paths swallowed it into `except Exception: pass` for
+months. The guarded action itself must still complete; only the override failure gets reported.
+
 **Endianness is not uniform across UDP ports** — it follows whichever MCU source file emits the packet.
 Each `lib/` module mirrors a packed C struct; the docstrings carry the authoritative byte layouts. Match
 the existing struct format string when editing a packet, and keep `tests/test_protocols.py` in sync — it is
 the guard against silently breaking wire compatibility.
+
+**All packet checksums go through `lib/crc.py::crc32_ieee`.** Do not reach for `zlib.crc32` — it computes
+the identical value (reflected `0xEDB88320`, init/xorout `0xFFFFFFFF`), so a second call site is pure
+duplication that puts checksum behaviour outside the one place `test_protocols.py` guards. That file pins
+exact packet bytes for the axis-config and PID-config builders; a change that alters the wire fails loudly.
 
 | Port | Module | Direction | Endianness |
 |------|--------|-----------|------------|

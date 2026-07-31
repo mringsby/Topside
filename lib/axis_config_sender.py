@@ -18,8 +18,8 @@ offset: millimeters from IMU to center of mass
 
 import socket
 import struct
-import zlib
 
+from lib.crc import crc32_ieee
 from lib.net_transport import DEFAULT_ROV_HOST
 
 NUCLEO_HOST = DEFAULT_ROV_HOST
@@ -78,7 +78,7 @@ def build_axis_packet(imu_axes: dict, accel_axes: dict, offset: dict) -> bytes:
         off_y,
         off_z,
     )
-    crc = zlib.crc32(body) & 0xFFFFFFFF
+    crc = crc32_ieee(body)
     return body + struct.pack("<I", crc)
 
 

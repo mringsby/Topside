@@ -827,8 +827,10 @@ class PidTuningScreen(ScreenBase):
             prefix = "Updated active setpoints: " if pid_active else "Saved setpoints: "
             self._set_feedback(prefix + text, "success")
         else:
+            error = result.get("error") or "Setpoint send failed."
             self._badge(self._setpoint_status_badge, "ERROR", "danger")
-            self._set_feedback(result.get("error") or "Setpoint send failed.", "danger")
+            self._set_feedback(error, "danger")
+            self.notify(error)
             if result.get("state"):
                 self._update_control_banner(result["state"])
 
@@ -851,12 +853,13 @@ class PidTuningScreen(ScreenBase):
         ctrl = self.hub.controller
         state = ctrl.stop_pid(clear=clear)
         client = self.hub.setpoint_override
+        override_error = None
         if client is not None:
             try:
                 client.clear_override()
-            except Exception:
-                pass
-        return {"state": state}
+            except Exception as exc:  # noqa: BLE001 - stopping PID must not fail; surfaced via notify below
+                override_error = str(exc)
+        return {"state": state, "override_error": override_error}
 
     def _on_stop_pid_done(self, result, clear):
         state = result.get("state") or {}
@@ -870,6 +873,8 @@ class PidTuningScreen(ScreenBase):
         self._update_control_banner(state)
         self._badge(self._setpoint_status_badge, "IDLE" if clear else "SAVED", "secondary" if clear else "info")
         self._set_feedback("Setpoints cleared." if clear else "PID stopped. Setpoints kept.", "light")
+        if result.get("override_error"):
+            self.notify(f"PID stopped, but clearing the override was refused: {result['override_error']}")
 
     def _clear_setpoints(self):
         self._stop_pid(clear=True)
@@ -914,7 +919,9 @@ class PidTuningScreen(ScreenBase):
                 self._update_control_banner(result["control_state"])
             self._set_feedback(f"{axis} setpoint cleared.", "success")
         else:
-            self._set_feedback(result.get("error") or "Clear failed.", "danger")
+            error = result.get("error") or "Clear failed."
+            self._set_feedback(error, "danger")
+            self.notify(error)
 
     # --- PID start/stop toggle + sanity gate --------------------------------------
 
@@ -993,9 +1000,11 @@ class PidTuningScreen(ScreenBase):
             self._set_feedback(f"{reason} Use Force Start to proceed anyway.", "warning")
             self.notify(f"PID start blocked: {reason}")
         else:
+            error = result.get("error") or "Start failed."
             self._btn_force_start.setVisible(False)
             self._badge(self._setpoint_status_badge, "BLOCKED", "danger")
-            self._set_feedback(result.get("error") or "Start failed.", "danger")
+            self._set_feedback(error, "danger")
+            self.notify(error)
             if result.get("state"):
                 self._update_control_banner(result["state"])
         self._refresh_enabled()
@@ -1022,12 +1031,13 @@ class PidTuningScreen(ScreenBase):
         zero_gains = logic.zero_pid_gains()
         send_pid_gains(zero_gains, timeout=0.5, max_retries=2)
         client = self.hub.setpoint_override
+        override_error = None
         if client is not None:
             try:
                 client.clear_override()
-            except Exception:
-                pass
-        return {"state": state}
+            except Exception as exc:  # noqa: BLE001 - the kill must not fail; surfaced via notify below
+                override_error = str(exc)
+        return {"state": state, "override_error": override_error}
 
     def _on_kill_done(self, result):
         for widget in self._sliders.values():
@@ -1036,6 +1046,8 @@ class PidTuningScreen(ScreenBase):
         self._sync_local_setpoints({})
         self._update_control_banner(result.get("state") or {})
         self._set_feedback("Controls killed.", "danger")
+        if result.get("override_error"):
+            self.notify(f"Controls killed, but clearing the override was refused: {result['override_error']}")
 
     def _rearm_controls(self):
         ctrl = self.hub.controller
@@ -1048,12 +1060,13 @@ class PidTuningScreen(ScreenBase):
         ctrl = self.hub.controller
         state = ctrl.rearm()
         client = self.hub.setpoint_override
+        override_error = None
         if client is not None:
             try:
                 client.clear_override()
-            except Exception:
-                pass
-        return {"state": state}
+            except Exception as exc:  # noqa: BLE001 - rearm must not fail; surfaced via notify below
+                override_error = str(exc)
+        return {"state": state, "override_error": override_error}
 
     def _on_rearm_done(self, result):
         for widget in self._sliders.values():
@@ -1062,6 +1075,8 @@ class PidTuningScreen(ScreenBase):
         self._sync_local_setpoints({})
         self._update_control_banner(result.get("state") or {})
         self._set_feedback("Controls re-armed.", "success")
+        if result.get("override_error"):
+            self.notify(f"Controls re-armed, but clearing the override was refused: {result['override_error']}")
 
     # --- MCU PID gains ------------------------------------------------------------
 
