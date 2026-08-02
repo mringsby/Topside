@@ -21,7 +21,7 @@ from desktop import logic
 from lib.aruco_logger import ArucoPipelineLogger
 from lib.axis_config_sender import send_axis_config
 from lib.bitmask import init_bitmask
-from lib.camera import init_camera, init_ip_camera, init_rpi_camera
+from lib.camera import init_ip_camera, init_rpi_camera
 from lib.control_telemetry import init_control_telemetry
 from lib.controller import Controller
 from lib.log_udp_receiver import init_log_stream
@@ -176,13 +176,6 @@ class ServiceHub(QObject):
             url=url,
             marker_logger=self.aruco_logger,
             **self.ip_camera_settings,
-        )
-
-        # Legacy Camera 1 feed — a local capture device, not an ROV camera.
-        self.default_camera = init_camera(
-            device_index=int(os.getenv("DEFAULT_CAMERA_DEVICE", "0")),
-            jpeg_quality=int(os.getenv("DEFAULT_CAMERA_JPEG_QUALITY", "70")),
-            marker_logger=self.aruco_logger,
         )
 
         self.resource = init_resource_receiver(port=12346)
@@ -367,7 +360,15 @@ class ServiceHub(QObject):
     # --- teardown ------------------------------------------------------------
 
     def shutdown(self):
-        """Mirrors app.py's atexit hook. Every service gets a chance to stop."""
+        """Mirrors app.py's atexit hook. Every service gets a chance to stop.
+
+        Idempotent: the shell calls this when the last window closes and `main()` calls it again
+        from its `finally`. With several windows open a second pass must not re-stop services
+        that are already down.
+        """
+        if getattr(self, "_shut_down", False):
+            return
+        self._shut_down = True
         for poller in self._pollers.values():
             poller._timer.stop()
         self._pool.waitForDone(2000)
@@ -378,7 +379,6 @@ class ServiceHub(QObject):
             ("imu", "stop"),
             ("rpi_camera", "stop"),
             ("ip_camera", "stop"),
-            ("default_camera", "stop"),
             ("resource", "stop"),
             ("control_telem", "stop"),
             ("log_stream", "stop"),

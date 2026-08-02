@@ -18,9 +18,7 @@ from PySide6.QtCore import QPointF
 from PySide6.QtGui import QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-#: matches connection.py's badge palette: success green / danger red.
-_COLOR_NORMAL = "#3fb950"
-_COLOR_ALERT = "#f85149"
+from desktop import theme
 
 
 class SparklineWidget(QWidget):
@@ -32,6 +30,7 @@ class SparklineWidget(QWidget):
         self._values = deque(maxlen=max_points)
         self._alert = False
         self.setMinimumSize(60, 20)
+        theme.signals.changed.connect(self.update)
 
     def add_value(self, value):
         """Append the latest sample and repaint."""
@@ -62,7 +61,8 @@ class SparklineWidget(QWidget):
             n = len(self._values)
             step = rect.width() / max(1, n - 1)
 
-            pen = QPen(_COLOR_ALERT if self._alert else _COLOR_NORMAL)
+            color = theme.token("danger") if self._alert else theme.token("success")
+            pen = QPen(color)
             pen.setWidthF(1.6)
             painter.setPen(pen)
 

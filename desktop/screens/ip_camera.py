@@ -1,14 +1,23 @@
 """IP camera screen — ports `/ip-camera` and `/Camera2` (both render `ip_camera.html` +
 `ip_camera.js`; `camera2.html` is dead per PARITY.md §2, not ported).
 
-Preset CRUD and the manual-IP "Apply" reassign live here. `hub.reassign_ip_camera()` tears down
-the old RTSP receiver and connects a new one — a multi-second blocking call per PARITY.md §1 — so
-it always runs through `hub.call_async`. The 3 s status poll is a cheap in-memory read and goes
-through `self.watch(...)`.
+Preset CRUD and the manual-IP "Apply" reassign live in `IpCameraControlPanel`. `hub.reassign_ip_camera()`
+tears down the old RTSP receiver and connects a new one — a multi-second blocking call per
+PARITY.md §1 — so it always runs through `hub.call_async`. The 3 s status poll is a cheap in-memory
+read and goes through `self.watch(...)`.
 
-Video comes from the shared `widgets/camera.py::CameraWidget`, which is handed a *callable*
-returning the receiver rather than the receiver itself — `reassign_ip_camera` replaces that object
-outright, so a cached reference would keep painting the dead stream.
+Video comes from the shared `widgets/camera.py::CameraWidget`, wrapped by `CameraViewPanel`. The
+widget is handed a *callable* returning the receiver rather than the receiver itself —
+`reassign_ip_camera` replaces that object outright, so a cached reference would keep painting the
+dead stream.
+
+Decomposed into two panels:
+
+  * `CameraViewPanel` — just the video. Read-only, `duplicable=True`.
+  * `IpCameraControlPanel` — the IP/URL form, presets, and Apply. Apply WRITES to the vehicle
+    (reassigns the live RTSP receiver), so this stays single-instance (`duplicable=False`).
+
+`IpCameraScreen` composes both side by side, same as before.
 """
 
 from PySide6.QtWidgets import (
@@ -21,40 +30,64 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from desktop import logic
-from desktop.screens.base import ScreenBase
+from desktop import logic, theme
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 from desktop.widgets.camera import CameraWidget
 
 STATUS_INTERVAL_MS = 3000
 
-_FEEDBACK_STYLES = {
-    "neutral": "color: palette(text);",
-    "good": "color: #3fb950;",
-    "warn": "color: #d29922;",
-    "bad": "color: #f85149;",
-}
+_FEEDBACK_STYLES = theme.BADGE
 
 
-class IpCameraScreen(ScreenBase):
-    title = "IP Camera"
+class CameraViewPanel(PanelBase):
+    """Just the video feed. Read-only, safe to duplicate."""
 
-    def __init__(self, hub, parent=None):
+    title = "IP Camera View"
+
+    def __init__(self, hub, notify=None, parent=None):
         super().__init__(hub, parent)
-        self._presets = []
+        self._forward_notify = notify
 
         # The receiver is passed as a callable, not an object: reassign swaps hub.ip_camera.
         self._camera = CameraWidget(lambda: self.hub.ip_camera, min_size=(480, 270))
         self._camera.problem.connect(self.notify)
 
-        panel = self._build_panel()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._camera, 1)
 
-        row = QHBoxLayout()
-        row.addWidget(self._camera, 1)
-        row.addWidget(panel)
+    def notify(self, message):
+        if self._forward_notify is not None:
+            self._forward_notify(message)
+        else:
+            super().notify(message)
+
+    def on_activate(self):
+        self._camera.start()
+
+    def on_deactivate(self):
+        """Stop decoding JPEGs for a tab nobody is looking at."""
+        self._camera.stop()
+
+
+class IpCameraControlPanel(PanelBase):
+    """IP/URL form, saved presets, and Apply. WRITES to the vehicle (reassigns the RTSP
+    receiver), so this must never be duplicated live."""
+
+    title = "IP Camera Controls"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        self._presets = []
+
+        box = self._build_panel()
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.notice_widget)
-        layout.addLayout(row)
+        layout.addWidget(box)
 
         self.watch("ip_camera.camera_status", self._status_fn, STATUS_INTERVAL_MS, self._on_status)
 
@@ -235,7 +268,6 @@ class IpCameraScreen(ScreenBase):
 
     def on_activate(self):
         """One-shot load, mirroring ip_camera.js's loadConfigs() call on page load."""
-        self._camera.start()
         section = logic.get_ip_camera_config()
         self._render_presets(section["presets"])
         active_ip, active_url, status = self.hub.camera_status()
@@ -245,6 +277,50 @@ class IpCameraScreen(ScreenBase):
             self._ip_input.setText(active_ip)
         self._set_state(status)
 
-    def on_deactivate(self):
-        """Stop decoding JPEGs for a tab nobody is looking at."""
-        self._camera.stop()
+
+class IpCameraScreen(ScreenBase):
+    title = "IP Camera"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+
+        self._camera_panel = CameraViewPanel(hub, notify=self.notify)
+        self._control_panel = IpCameraControlPanel(hub)
+
+        row = QHBoxLayout()
+        row.addWidget(self._camera_panel, 1)
+        row.addWidget(self._control_panel)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.notice_widget)
+        layout.addLayout(row)
+
+    # --- back-compat delegate ----------------------------------------------------------
+    # Nothing outside this module referenced screen internals before the split, but the camera
+    # widget identity is the one thing worth keeping stable in case something starts.
+
+    @property
+    def _camera(self):
+        return self._camera_panel._camera
+
+
+#: The control panel WRITES to the vehicle (Apply reassigns the live RTSP receiver), so it must
+#: stay single-instance. The video view only ever reads, so it is free to duplicate.
+COMPONENTS = [
+    Component(
+        id="panel.ip_camera.view",
+        title="IP Camera: View",
+        factory=CameraViewPanel,
+        category="Cameras",
+        duplicable=True,
+        order=0,
+    ),
+    Component(
+        id="panel.ip_camera.controls",
+        title="IP Camera: Controls",
+        factory=IpCameraControlPanel,
+        category="Cameras",
+        duplicable=False,
+        order=1,
+    ),
+]

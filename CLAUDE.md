@@ -58,10 +58,11 @@ uv run --frozen --no-default-groups --group lint ruff check .            # CI ga
 CI (`.github/workflows/checks.yml`) runs only the two ruff commands — not pytest. Run `ruff format .` on
 files you touch.
 
-Headless smoke-testing a screen (no hardware needed — every service degrades to disabled controls):
+Headless smoke-testing (no hardware needed — every service degrades to disabled controls):
 `QT_QPA_PLATFORM=offscreen PYTHONPATH=. uv run python -m desktop` won't stay up on its own, so build a
-short script that constructs `MainWindow(ServiceHub())`, ticks the pollers, and shuts down. That is how
-every screen in the port was verified.
+short script that constructs `Shell(ServiceHub())`, opens some components, drives a gesture through
+`GridCanvas.begin_gesture`/`update_gesture`/`end_gesture`, and shuts down. See `desktop/HANDOFF.md` §5
+for the assertions worth making.
 
 `test.py` at the repo root is **not** a test — it's a standalone resource-monitor CLI. pytest's
 `testpaths = ["tests"]` excludes it.
@@ -70,14 +71,29 @@ every screen in the port was verified.
 
 ```
 desktop/            the application
-  main.py           composition root: QApplication, MainWindow, tabs
-  registry.py       SCREENS list — the one file screen work shares
+  main.py           composition root: QApplication, theme, ServiceHub, Shell
+  shell.py          Shell + WorkspaceWindow — what is open where, and preset save/load
+  grid.py           GridCanvas + GridTile + the cell arithmetic — where things sit and how they move
+  component.py      the Component descriptor (import it from here, never from registry)
+  registry.py       COMPONENTS — the one file component work shares
+  theme.py          dark/light palette tokens, applied app-wide
   services.py       ServiceHub (owns every lib/ service), Poller, call_async
   logic.py          pure functions: validation, clamping, persisted-settings IO. No Qt.
-  screens/          one module per tab, all extending ScreenBase
+  screens/          one module per screen; each exports its panels as COMPONENTS
+    base.py         PanelBase (hosted in a tile, hub-backed) and ScreenBase(PanelBase)
   widgets/          reusable widgets shared by more than one screen
 lib/                hardware layer — UDP protocols, cameras, controller. Knows nothing about the GUI.
 ```
+
+**A workspace is a 12-column snap grid, not a set of screens.** It starts empty; the operator adds
+components from the Components menu, drags them by the header and resizes them from the right/bottom
+edge, and saves the arrangement as a named preset. `Classic` — the ten whole screens stacked — is just
+one such preset now, no longer the default. There are no tabs and no tear-out to a second monitor;
+opening a second workspace window is what replaces both.
+
+**`desktop/HANDOFF.md` is where the current work stands** — what changed in the grid port, the
+non-obvious decisions that will bite you, the recipe for adding a panel, what is still left, and
+how to verify headlessly. Read it before touching the shell, the grid, `PanelBase`, or the registry.
 
 `desktop/PARITY.md` is the port's spec: what every retired endpoint became, and why. Read it before
 changing behaviour that used to be an API route.
@@ -167,11 +183,21 @@ its `.stop()`/`.close()` to `ServiceHub.shutdown()`. Each service owns a daemon 
 `start()` / `stop()` / `get_status()`-or-`get_stats()` shape. Screens read `hub.<service>` and disable
 their widgets when it is `None` — that degradation is what makes screens testable without hardware.
 
-**Adding a screen:** subclass `ScreenBase`, set `title`, then add it to `SCREENS` in `registry.py`. That
-is the only shared file; everything else is per-screen.
+**Adding a panel or screen:** subclass `PanelBase` (a screen is just a panel that wants a large tile),
+set `title`, do your own `self.watch(...)` so it works alone in a tile, and export a `COMPONENTS` list from
+your own module — importing `Component` from `desktop/component.py`, never from `registry.py`, which
+would be circular. `registry.py` is the only shared file and is integrator-owned: it adds the import and
+the concatenation line. `desktop/screens/graphs.py` is the worked reference; full recipe in
+`desktop/HANDOFF.md` §3.
 
-**Camera receivers** each keep a latest-JPEG buffer plus a frame sequence number. All three feed the single
-shared `ArucoPipelineLogger`, and all three are rendered by `widgets/camera.py::CameraWidget` — which takes
+**`duplicable` is a hardware-safety flag, not a UI preference.** Only read-only displays may be
+duplicated. Anything that writes to the vehicle stays single-instance — two live debug-override panels
+would each run a 20 Hz command loop and make the killed → override → joystick priority in
+`Controller.update()` non-deterministic. A composite screen must also declare `owns` for the panels it
+contains, or the guard misses it: a screen and its own panel have different component ids.
+
+**Camera receivers** each keep a latest-JPEG buffer plus a frame sequence number. Both feed the single
+shared `ArucoPipelineLogger`, and both are rendered by `widgets/camera.py::CameraWidget` — which takes
 a *callable* returning the receiver, not the receiver itself, because `reassign_ip_camera()` swaps the
 object at runtime. The RPi RTP path falls back to spawning `gst-launch-1.0` and parsing JPEGs off its
 stdout; on that path frames are already JPEG-encoded, so it deliberately skips a decode/re-encode round

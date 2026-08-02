@@ -1,7 +1,9 @@
 """Config screen — ports `/config` (`config.html` + `configuration.js`).
 
 Covers the Input Source status card, controller gain sliders, PID setpoint rates, IMU and
-accelerometer axis mapping, and the IMU offset from mass center.
+accelerometer axis mapping, and the IMU offset from mass center. Each card is its own
+`PanelBase` (see the class list below) so it can be docked and worked with independently;
+`ConfigScreen` just composes them, mirroring the split in `desktop/screens/graphs.py`.
 
 Any IMU axis or offset change must re-send the FULL axis config packet via
 `hub.send_full_axis_config()` — the MCU takes remap and offset together in one packet, so a
@@ -9,6 +11,10 @@ partial update is a wire-protocol bug (see CLAUDE.md Invariants and PARITY.md §
 `send_axis_config` (used by that hub method) is a fire-and-forget UDP send with no reply wait,
 so — like `configuration.js`'s synchronous-looking saves — it is called directly from the slot,
 not through `hub.call_async`; it is not in the PARITY.md §1 blocking-call table.
+
+Port 5004 has no ACK, so `start_axis_probe`/`finish_axis_probe` below (shared by the IMU axis,
+accelerometer axis, and offset panels) can only report whether the 9DOF stream is still alive
+after the send — never that the remap itself was applied. Do not reword that.
 """
 
 from PySide6.QtCore import Qt, QTimer
@@ -25,8 +31,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from desktop import logic
-from desktop.screens.base import ScreenBase
+from desktop import logic, theme
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 
 STATUS_INTERVAL_MS = 1000
 GAIN_SAVE_DEBOUNCE_MS = 250
@@ -40,18 +47,62 @@ IMU_AXIS_OPTIONS = {
 }
 ACCEL_AXIS_OPTIONS = ["+x", "-x", "+y", "-y", "+z", "-z"]
 
-_STATUS_STYLES = {
-    "neutral": "color: palette(text);",
-    "good": "color: #3fb950; font-weight: 600;",
-    "bad": "color: #f85149; font-weight: 600;",
-    "warn": "color: #d29922; font-weight: 600;",
-}
+_STATUS_STYLES = theme.BADGE
 
 
 def _badge(text="", tone="neutral"):
     label = QLabel(text)
     label.setStyleSheet(_STATUS_STYLES[tone])
     return label
+
+
+def command_status(hub):
+    """Replaces GET /api/command/status. Cheap in-memory reads only.
+
+    Module-level so `InputSourcePanel` can feed itself from its own poller — matching
+    `sample_imu()` in graphs.py, this is what lets the panel work self-sufficiently in a dock.
+    """
+    uplink = hub.bitmask.get_uplink_status() if hub.bitmask else {}
+    controller_state = hub.controller.get_input_status() if hub.controller else {}
+    override_state = hub.setpoint_override.get_state() if hub.setpoint_override else {}
+    return {"uplink": uplink, "controller": controller_state, "override": override_state}
+
+
+def start_axis_probe(hub, notify, feedback_label, success_text):
+    """After a successful send_full_axis_config(), check the MCU is still alive.
+
+    UDP 5004 has no ACK: a dropped packet silently leaves the MCU on the old axis remap while
+    the caller says "sent". We CANNOT confirm the remap was applied correctly from here -- that
+    needs the vehicle physically moved. What we CAN check is liveness: sample the 9DOF stream
+    (UDP 5002) briefly and see if it is still producing fresh samples. That catches the real
+    failure modes -- MCU crashed, rebooted, or stopped publishing.
+
+    Shared by every panel that sends a full axis config (IMU axis mapping, accelerometer axis
+    mapping, IMU offset) so the liveness wording — and the "never say verified" rule — lives in
+    exactly one place.
+    """
+    imu = hub.imu
+    if imu is None:
+        feedback_label.setText(f"{success_text} · sent (no IMU receiver available to check)")
+        return
+    baseline = imu.get_stats().get("packet_count") or 0
+    feedback_label.setText(f"{success_text} · sent, confirming IMU stream is alive...")
+    QTimer.singleShot(
+        AXIS_PROBE_DELAY_MS,
+        lambda: finish_axis_probe(notify, feedback_label, success_text, imu, baseline),
+    )
+
+
+def finish_axis_probe(notify, feedback_label, success_text, imu, baseline):
+    """Report liveness only -- never claim the axis remap itself was verified."""
+    stats = imu.get_stats()
+    count = stats.get("packet_count") or 0
+    if count > baseline:
+        feedback_label.setText(f"{success_text} · sent · IMU stream alive")
+    else:
+        message = f"{success_text} · sent · NO IMU DATA — config may not have applied"
+        feedback_label.setText(message)
+        notify(message)
 
 
 class _GainSlider(QWidget):
@@ -88,31 +139,19 @@ class _GainSlider(QWidget):
         self._value_label.setText(f"{round(self.value() * 100)}%")
 
 
-class ConfigScreen(ScreenBase):
-    title = "Config"
+class InputSourcePanel(PanelBase):
+    """Read-only snapshot of who is currently driving the thrusters (controller vs override)."""
+
+    title = "Input Source"
 
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
-
         layout = QVBoxLayout(self)
-        layout.addWidget(self.notice_widget)
-        layout.addWidget(self._build_input_source_box())
-        layout.addWidget(self._build_gain_box())
-        layout.addWidget(self._build_pid_rates_box())
-        layout.addWidget(self._build_imu_axes_box())
-        layout.addWidget(self._build_accel_axes_box())
-        layout.addWidget(self._build_offset_box())
-        layout.addStretch(1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_box())
+        self.watch("command.status", lambda: command_status(self.hub), STATUS_INTERVAL_MS, self._on_command_status)
 
-        self._gain_save_timer = QTimer(self)
-        self._gain_save_timer.setSingleShot(True)
-        self._gain_save_timer.timeout.connect(self._save_gains)
-
-        self.watch("command.status", self._command_status, STATUS_INTERVAL_MS, self._on_command_status)
-
-    # --- Input Source ---------------------------------------------------------
-
-    def _build_input_source_box(self):
+    def _build_box(self):
         box = QGroupBox("Input Source")
         self._input_badge = _badge("UNKNOWN")
         self._input_controller = QLabel("--")
@@ -135,14 +174,6 @@ class ConfigScreen(ScreenBase):
         outer.addLayout(header)
         outer.addLayout(grid)
         return box
-
-    def _command_status(self):
-        """Replaces GET /api/command/status. Cheap in-memory reads only."""
-        hub = self.hub
-        uplink = hub.bitmask.get_uplink_status() if hub.bitmask else {}
-        controller_state = hub.controller.get_input_status() if hub.controller else {}
-        override_state = hub.setpoint_override.get_state() if hub.setpoint_override else {}
-        return {"uplink": uplink, "controller": controller_state, "override": override_state}
 
     def _on_command_status(self, status):
         controller = status.get("controller", {})
@@ -167,9 +198,23 @@ class ConfigScreen(ScreenBase):
             self._input_badge.setText("IDLE")
             self._input_badge.setStyleSheet(_STATUS_STYLES["neutral"])
 
-    # --- Controller gain --------------------------------------------------------
 
-    def _build_gain_box(self):
+class ControllerGainPanel(PanelBase):
+    """Master + per-axis gain sliders, debounced-saved to `data.json` via the hub."""
+
+    title = "Controller Gain"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_box())
+
+        self._gain_save_timer = QTimer(self)
+        self._gain_save_timer.setSingleShot(True)
+        self._gain_save_timer.timeout.connect(self._save_gains)
+
+    def _build_box(self):
         box = QGroupBox("Controller Gain")
         self._gain_badge = _badge("LOADING")
         header = QHBoxLayout()
@@ -231,7 +276,7 @@ class ConfigScreen(ScreenBase):
     def _save_gains(self):
         try:
             cleaned = self.hub.save_controller_gains(self._read_gains())
-        except Exception as exc:  # settings IO should not crash the screen
+        except Exception as exc:  # settings IO should not crash the panel
             self._gain_badge.setText("ERROR")
             self._gain_badge.setStyleSheet(_STATUS_STYLES["bad"])
             self._gain_feedback.setText(f"Error: {exc}")
@@ -245,9 +290,27 @@ class ConfigScreen(ScreenBase):
         self._fill_gains({"master": 1.0, "axes": {axis: 1.0 for axis in logic.CONTROL_AXES}})
         self._save_gains()
 
-    # --- PID setpoint rates -------------------------------------------------------
+    def on_activate(self):
+        """One-shot load, mirroring the page-load fetch in configuration.js."""
+        self._fill_gains(logic.load_controller_gains())
+        if self.hub.controller:
+            self.hub.controller.set_controller_gains(self._read_gains())
+        self._gain_badge.setText("READY")
+        self._gain_badge.setStyleSheet(_STATUS_STYLES["good"])
 
-    def _build_pid_rates_box(self):
+
+class PidSetpointRatesPanel(PanelBase):
+    """Max deg/s rate for each attitude axis under PID hold."""
+
+    title = "PID Setpoint Rates"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_box())
+
+    def _build_box(self):
         box = QGroupBox("PID Setpoint Rates")
         grid = QGridLayout()
         self._pid_rate_fields = {}
@@ -272,13 +335,6 @@ class ConfigScreen(ScreenBase):
         outer.addWidget(self._pid_rates_feedback)
         return box
 
-    def _load_pid_rates(self):
-        rates = logic.load_pid_rates()
-        if self.hub.controller:
-            self.hub.controller.set_pid_rates(rates)
-        for axis, field in self._pid_rate_fields.items():
-            field.setValue(rates.get(axis, 90.0))
-
     def _save_pid_rates(self):
         data = {axis: field.value() for axis, field in self._pid_rate_fields.items()}
         try:
@@ -290,9 +346,27 @@ class ConfigScreen(ScreenBase):
             field.setValue(rates.get(axis, 90.0))
         self._pid_rates_feedback.setText("Rates saved")
 
-    # --- IMU axis mapping -----------------------------------------------------
+    def on_activate(self):
+        rates = logic.load_pid_rates()
+        if self.hub.controller:
+            self.hub.controller.set_pid_rates(rates)
+        for axis, field in self._pid_rate_fields.items():
+            field.setValue(rates.get(axis, 90.0))
 
-    def _build_imu_axes_box(self):
+
+class ImuAxisMappingPanel(PanelBase):
+    """Which physical IMU axis feeds each ROV attitude axis."""
+
+    title = "IMU Axis Mapping"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._build_box())
+
+    def _build_box(self):
         box = QGroupBox("IMU Axis Mapping")
         grid = QGridLayout()
         self._imu_axis_combos = {}
@@ -307,14 +381,14 @@ class ConfigScreen(ScreenBase):
         btn_save.clicked.connect(self._save_imu_axes)
         grid.addWidget(btn_save, 1, len(logic.ATTITUDE_AXES))
 
-        self._axes_feedback = QLabel("")
+        self._feedback = QLabel("")
 
         outer = QVBoxLayout(box)
         outer.addLayout(grid)
-        outer.addWidget(self._axes_feedback)
+        outer.addWidget(self._feedback)
         return box
 
-    def _load_imu_axes(self):
+    def on_activate(self):
         axes = logic.load_imu_axes()
         for axis, combo in self._imu_axis_combos.items():
             value = axes.get(axis)
@@ -335,13 +409,24 @@ class ConfigScreen(ScreenBase):
                 self.hub.imu.set_axis_mapping(axes)
             self.hub.send_full_axis_config()
         except Exception as exc:
-            self._axes_feedback.setText(f"Error: {exc}")
+            self._feedback.setText(f"Error: {exc}")
             return
-        self._start_axis_probe(self._axes_feedback, "Mapping saved")
+        start_axis_probe(self.hub, self.notify, self._feedback, "Mapping saved")
 
-    # --- Accelerometer axis mapping -----------------------------------------------
 
-    def _build_accel_axes_box(self):
+class AccelAxisMappingPanel(PanelBase):
+    """Which physical accelerometer axis feeds each ROV linear axis."""
+
+    title = "Accelerometer Axis Mapping"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._build_box())
+
+    def _build_box(self):
         box = QGroupBox("Accelerometer Axis Mapping")
         grid = QGridLayout()
         self._accel_axis_combos = {}
@@ -356,14 +441,14 @@ class ConfigScreen(ScreenBase):
         btn_save.clicked.connect(self._save_accel_axes)
         grid.addWidget(btn_save, 1, 3)
 
-        self._accel_feedback = QLabel("")
+        self._feedback = QLabel("")
 
         outer = QVBoxLayout(box)
         outer.addLayout(grid)
-        outer.addWidget(self._accel_feedback)
+        outer.addWidget(self._feedback)
         return box
 
-    def _load_accel_axes(self):
+    def on_activate(self):
         axes = logic.load_accel_axes()
         for axis, combo in self._accel_axis_combos.items():
             value = axes.get(axis)
@@ -384,13 +469,24 @@ class ConfigScreen(ScreenBase):
                 self.hub.imu.set_accel_mapping(axes)
             self.hub.send_full_axis_config()
         except Exception as exc:
-            self._accel_feedback.setText(f"Error: {exc}")
+            self._feedback.setText(f"Error: {exc}")
             return
-        self._start_axis_probe(self._accel_feedback, "Accelerometer mapping saved")
+        start_axis_probe(self.hub, self.notify, self._feedback, "Accelerometer mapping saved")
 
-    # --- IMU offset from mass center -----------------------------------------------
 
-    def _build_offset_box(self):
+class ImuOffsetPanel(PanelBase):
+    """IMU physical offset from the vehicle's mass center, used by the MCU's attitude math."""
+
+    title = "IMU Offset from Mass Center"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._build_box())
+
+    def _build_box(self):
         box = QGroupBox("IMU Offset from Mass Center")
         grid = QGridLayout()
         labels = {"x": "X forward +", "y": "Y starboard +", "z": "Z down +"}
@@ -408,14 +504,14 @@ class ConfigScreen(ScreenBase):
         btn_save.clicked.connect(self._save_offset)
         grid.addWidget(btn_save, 1, 3)
 
-        self._offset_feedback = QLabel("")
+        self._feedback = QLabel("")
 
         outer = QVBoxLayout(box)
         outer.addLayout(grid)
-        outer.addWidget(self._offset_feedback)
+        outer.addWidget(self._feedback)
         return box
 
-    def _load_offset(self):
+    def on_activate(self):
         offset = logic.load_imu_offset()
         for axis, field in self._offset_fields.items():
             field.setValue(float(offset.get(axis, 0.0)))
@@ -428,54 +524,120 @@ class ConfigScreen(ScreenBase):
             logic.config_handler.update_data({"imu_offset": offset})
             self.hub.send_full_axis_config()
         except Exception as exc:
-            self._offset_feedback.setText(f"Error: {exc}")
+            self._feedback.setText(f"Error: {exc}")
             return
-        self._start_axis_probe(self._offset_feedback, "Offset saved")
+        start_axis_probe(self.hub, self.notify, self._feedback, "Offset saved")
+
+
+class ConfigScreen(ScreenBase):
+    title = "Config"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+
+        self._input_source_panel = InputSourcePanel(hub)
+        self._gain_panel = ControllerGainPanel(hub)
+        self._pid_rates_panel = PidSetpointRatesPanel(hub)
+        self._imu_axes_panel = ImuAxisMappingPanel(hub)
+        self._accel_axes_panel = AccelAxisMappingPanel(hub)
+        self._offset_panel = ImuOffsetPanel(hub)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._input_source_panel)
+        layout.addWidget(self._gain_panel)
+        layout.addWidget(self._pid_rates_panel)
+        layout.addWidget(self._imu_axes_panel)
+        layout.addWidget(self._accel_axes_panel)
+        layout.addWidget(self._offset_panel)
+        layout.addStretch(1)
+
+        # --- back-compat aliases ---------------------------------------------------------------
+        # tests/test_desktop_screens.py asserts on these attribute names directly, and calls
+        # _start_axis_probe()/_finish_axis_probe() on the screen itself.
+        self._input_badge = self._input_source_panel._input_badge
+        self._input_controller = self._input_source_panel._input_controller
+        self._input_override = self._input_source_panel._input_override
+        self._input_last_ack = self._input_source_panel._input_last_ack
+
+        self._gain_badge = self._gain_panel._gain_badge
+        self._gain_master = self._gain_panel._gain_master
+        self._gain_axes = self._gain_panel._gain_axes
+        self._gain_feedback = self._gain_panel._gain_feedback
+
+        self._pid_rate_fields = self._pid_rates_panel._pid_rate_fields
+        self._pid_rates_feedback = self._pid_rates_panel._pid_rates_feedback
+
+        self._imu_axis_combos = self._imu_axes_panel._imu_axis_combos
+        self._axes_feedback = self._imu_axes_panel._feedback
+
+        self._accel_axis_combos = self._accel_axes_panel._accel_axis_combos
+        self._accel_feedback = self._accel_axes_panel._feedback
+
+        self._offset_fields = self._offset_panel._offset_fields
+        self._offset_feedback = self._offset_panel._feedback
+
+        # No watch() of its own: each panel polls/loads itself, and PanelBase.set_active cascades
+        # activation down to them (see graphs.py for the same pattern).
 
     # --- axis config liveness probe ------------------------------------------------
+    # Kept on the screen (delegating to the module-level helpers above) because
+    # tests/test_desktop_screens.py calls screen._start_axis_probe()/_finish_axis_probe() directly.
 
     def _start_axis_probe(self, feedback_label, success_text):
-        """After a successful send_full_axis_config(), check the MCU is still alive.
-
-        UDP 5004 has no ACK: a dropped packet silently leaves the MCU on the old axis remap
-        while this screen says "sent". We CANNOT confirm the remap was applied correctly from
-        here -- that needs the vehicle physically moved. What we CAN check is liveness: sample
-        the 9DOF stream (UDP 5002) briefly and see if it is still producing fresh samples. That
-        catches the real failure modes -- MCU crashed, rebooted, or stopped publishing.
-        """
-        imu = self.hub.imu
-        if imu is None:
-            feedback_label.setText(f"{success_text} · sent (no IMU receiver available to check)")
-            return
-        baseline = imu.get_stats().get("packet_count") or 0
-        feedback_label.setText(f"{success_text} · sent, confirming IMU stream is alive...")
-        QTimer.singleShot(
-            AXIS_PROBE_DELAY_MS,
-            lambda: self._finish_axis_probe(feedback_label, success_text, imu, baseline),
-        )
+        start_axis_probe(self.hub, self.notify, feedback_label, success_text)
 
     def _finish_axis_probe(self, feedback_label, success_text, imu, baseline):
-        """Report liveness only -- never claim the axis remap itself was verified."""
-        stats = imu.get_stats()
-        count = stats.get("packet_count") or 0
-        if count > baseline:
-            feedback_label.setText(f"{success_text} · sent · IMU stream alive")
-        else:
-            message = f"{success_text} · sent · NO IMU DATA — config may not have applied"
-            feedback_label.setText(message)
-            self.notify(message)
+        finish_axis_probe(self.notify, feedback_label, success_text, imu, baseline)
 
-    # --- lifecycle ----------------------------------------------------------
 
-    def on_activate(self):
-        """One-shot loads, mirroring the page-load fetches in configuration.js."""
-        self._fill_gains(logic.load_controller_gains())
-        if self.hub.controller:
-            self.hub.controller.set_controller_gains(self._read_gains())
-        self._gain_badge.setText("READY")
-        self._gain_badge.setStyleSheet(_STATUS_STYLES["good"])
-
-        self._load_pid_rates()
-        self._load_imu_axes()
-        self._load_accel_axes()
-        self._load_offset()
+COMPONENTS = [
+    Component(
+        id="panel.config.input_source",
+        title="Input Source",
+        factory=InputSourcePanel,
+        category="Config",
+        duplicable=False,
+        order=0,
+    ),
+    Component(
+        id="panel.config.controller_gain",
+        title="Controller Gain",
+        factory=ControllerGainPanel,
+        category="Config",
+        duplicable=False,
+        order=1,
+    ),
+    Component(
+        id="panel.config.pid_setpoint_rates",
+        title="PID Setpoint Rates",
+        factory=PidSetpointRatesPanel,
+        category="Config",
+        duplicable=False,
+        order=2,
+    ),
+    Component(
+        id="panel.config.imu_axis_mapping",
+        title="IMU Axis Mapping",
+        factory=ImuAxisMappingPanel,
+        category="Config",
+        duplicable=False,
+        order=3,
+    ),
+    Component(
+        id="panel.config.accel_axis_mapping",
+        title="Accelerometer Axis Mapping",
+        factory=AccelAxisMappingPanel,
+        category="Config",
+        duplicable=False,
+        order=4,
+    ),
+    Component(
+        id="panel.config.imu_offset",
+        title="IMU Offset from Mass Center",
+        factory=ImuOffsetPanel,
+        category="Config",
+        duplicable=False,
+        order=5,
+    ),
+]

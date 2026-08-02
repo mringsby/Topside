@@ -12,8 +12,11 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QGroupBox
 
+from desktop import grid, registry
+from desktop.grid import GridCanvas, Placement
+from desktop.screens.base import PanelBase
 from desktop.screens.config import ConfigScreen
 from desktop.screens.connection import ConnectionScreen
 from desktop.screens.debug import DebugScreen
@@ -89,19 +92,43 @@ class FakeSetpointOverride:
         self.last_error = message
 
 
+class _StubSignal:
+    """Per-instance stand-in for a Qt signal. Must support disconnect -- PanelBase.teardown()
+    disconnects its own slot so it does not sever other panels sharing the same poller."""
+
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
+
+    def disconnect(self, slot):
+        self.slots.remove(slot)
+
+    def emit(self, payload):
+        for slot in list(self.slots):
+            slot(payload)
+
+
 class _StubPoller:
-    """Duck-types desktop.services.Poller without ever starting a QTimer or hitting hardware."""
+    """Duck-types desktop.services.Poller without ever starting a QTimer or hitting hardware.
 
-    class _Signal:
-        def connect(self, _slot):
-            pass
+    `_subscribers` mirrors the real reference count, which is the observable that proves a
+    panel behind a dock tab costs nothing.
+    """
 
-    updated = _Signal()
+    def __init__(self):
+        self.updated = _StubSignal()
+        self.failed = _StubSignal()
+        self._subscribers = 0
 
     def subscribe(self):
-        pass
+        self._subscribers += 1
 
     def unsubscribe(self):
+        self._subscribers = max(0, self._subscribers - 1)
+
+    def set_interval(self, interval_ms):
         pass
 
 
@@ -116,11 +143,18 @@ class FakeHub:
         self.bitmask = None
         self.resource = resource
         self.log_stream = None
+        self.control_telem = None
         self.imu = imu
         self.neutralize_calls = 0
+        self.pollers = {}
+        self.shutdown_calls = 0
+
+    def shutdown(self):
+        self.shutdown_calls += 1
 
     def poller(self, key, fn, interval_ms):
-        return _StubPoller()
+        """Memoized by key, like the real ServiceHub -- two panels watching one key share a timer."""
+        return self.pollers.setdefault(key, _StubPoller())
 
     def call_async(self, fn, on_done=None, on_error=None):
         try:
@@ -415,3 +449,540 @@ def test_config_screen_axis_probe_degrades_without_imu_receiver(qapp):
     screen._start_axis_probe(screen._offset_feedback, "Offset saved")
 
     assert "no IMU receiver available" in screen._offset_feedback.text()
+
+
+# --- panel lifecycle: a tile you cannot see must cost nothing ------------------------------------
+# The trap this guards: a panel scrolled out of the canvas viewport is still isVisible() as far as
+# Qt is concerned, so showEvent/hideEvent alone would leave it polling forever. PanelBase.bind_host()
+# hands activation to the host's visibilityChanged instead, which GridCanvas drives from the
+# viewport. (Under the old dock shell the same signal came from a dock tabbed behind another.)
+
+
+class _CountingPanel(PanelBase):
+    title = "Counting"
+
+    def __init__(self, hub, key="panel.probe", parent=None):
+        super().__init__(hub, parent)
+        self.activations = 0
+        self.deactivations = 0
+        self.poller = self.watch(key, lambda: None, 100, self._on_sample)
+
+    def _on_sample(self, payload):
+        pass
+
+    def on_activate(self):
+        self.activations += 1
+
+    def on_deactivate(self):
+        self.deactivations += 1
+
+
+def _canvas(qapp, height=400):
+    """A shown canvas with a known viewport, so 'scrolled out of view' is deterministic."""
+    canvas = GridCanvas()
+    canvas.resize(800, height)
+    canvas.show()
+    qapp.processEvents()
+    return canvas
+
+
+def _tile(canvas, panel, title, placement=None):
+    """add_tile binds the panel to the tile itself; doing it here would be too late."""
+    tile = canvas.add_tile(title, panel, placement)
+    tile.setObjectName(f"tile.{title}")
+    return tile
+
+
+def test_panel_scrolled_out_of_the_viewport_stops_polling(qapp):
+    canvas = _canvas(qapp, height=300)
+    hub = FakeHub()
+    near = _CountingPanel(hub, key="panel.near")
+    far = _CountingPanel(hub, key="panel.far")
+    # ROW_HEIGHT is 44, so row 40 is ~1760px down: far below a 300px viewport.
+    _tile(canvas, near, "near", Placement(0, 0, 6, 4))
+    _tile(canvas, far, "far", Placement(0, 40, 6, 4))
+    qapp.processEvents()
+
+    # `far` is still isVisible() as far as Qt is concerned -- that is exactly why showEvent/
+    # hideEvent is not enough and the canvas has to drive visibility from its viewport.
+    assert near._active is True
+    assert far._active is False
+    assert near.poller._subscribers == 1
+    assert far.poller._subscribers == 0
+
+    canvas.verticalScrollBar().setValue(canvas.verticalScrollBar().maximum())
+    qapp.processEvents()
+
+    assert far._active is True
+    assert far.poller._subscribers == 1
+    assert near.poller._subscribers == 0
+    canvas.close()
+
+
+def test_panel_teardown_returns_poller_refcount_to_zero(qapp):
+    canvas = _canvas(qapp)
+    hub = FakeHub()
+    panel = _CountingPanel(hub)
+    _tile(canvas, panel, "solo", Placement(0, 0, 6, 4))
+    qapp.processEvents()
+    assert panel.poller._subscribers == 1
+
+    panel.teardown()
+
+    # Without teardown the refcount would stay at 1 and the shared timer would run forever.
+    assert panel.poller._subscribers == 0
+    assert panel.poller.updated.slots == []
+    canvas.close()
+
+
+def test_teardown_leaves_a_sibling_sharing_the_same_poller_connected(qapp):
+    """Both panels watch one key, so hub.poller() hands them the same object."""
+    hub = FakeHub()
+    keeper = _CountingPanel(hub, key="panel.shared")
+    goer = _CountingPanel(hub, key="panel.shared")
+    assert keeper.poller is goer.poller
+    assert len(keeper.poller.updated.slots) == 2
+
+    goer.teardown()
+
+    # A bare updated.disconnect() would have severed the keeper's slot too.
+    assert keeper.poller.updated.slots == [keeper._on_sample]
+
+
+def test_set_active_cascades_to_nested_child_panels(qapp):
+    hub = FakeHub()
+    parent = _CountingPanel(hub, key="panel.parent")
+    box = QGroupBox(parent)  # nesting makes the child a grandchild, not a direct child
+    child = _CountingPanel(hub, key="panel.child", parent=box)
+
+    parent.set_active(True)
+
+    assert child._active is True
+    assert child.poller._subscribers == 1
+
+    parent.set_active(False)
+
+    assert child._active is False
+    assert child.poller._subscribers == 0
+
+
+def test_child_of_a_hosted_panel_does_not_self_activate_on_show(qapp):
+    """A child built after bind_host() must still defer to the tile, not to its own showEvent."""
+    canvas = _canvas(qapp, height=200)
+    hub = FakeHub()
+    parent = _CountingPanel(hub, key="panel.host")
+    # Placed off the bottom of the viewport, so the host reports it as not visible.
+    _tile(canvas, parent, "host", Placement(0, 40, 6, 4))
+    child = _CountingPanel(hub, key="panel.hosted-child", parent=parent)
+    child.show()
+    qapp.processEvents()
+
+    assert child._host_managed() is True
+    assert child._active is False
+    assert child.poller._subscribers == 0
+
+    canvas.verticalScrollBar().setValue(canvas.verticalScrollBar().maximum())
+    qapp.processEvents()
+
+    assert child._active is True
+    canvas.close()
+
+
+def test_unhosted_panel_still_activates_on_show(qapp):
+    """Screens constructed directly -- in a plain layout or a test -- keep the old behaviour."""
+    hub = FakeHub()
+    panel = _CountingPanel(hub, key="panel.unhosted")
+    panel.show()
+    qapp.processEvents()
+
+    assert panel._active is True
+    assert panel.poller._subscribers == 1
+
+    panel.hide()
+    qapp.processEvents()
+
+    assert panel._active is False
+    assert panel.poller._subscribers == 0
+
+
+# --- workspace shell ----------------------------------------------------------------------------
+# Shutdown ownership and single-instance enforcement are the two things here that turn a UI bug
+# into a hardware bug, so they are asserted directly rather than through a screen.
+
+
+class _ShellHub(FakeHub):
+    """FakeHub plus the surface Shell itself touches."""
+
+
+def _shell(qapp):
+    from desktop.shell import Shell
+
+    shell = Shell(_ShellHub(), app=qapp)
+    return shell
+
+
+def test_a_new_workspace_starts_empty(qapp):
+    """No default arrangement: the operator builds one out of the Components menu."""
+    shell = _shell(qapp)
+
+    window = shell.load_empty()
+
+    assert len(shell.windows) == 1
+    assert window.tiles == []
+    window.close()
+
+
+def test_opening_components_tiles_them_without_overlapping(qapp):
+    """The dock shell put every component full-width in one column; the grid must not."""
+    shell = _shell(qapp)
+    window = shell.new_window()
+    window.resize(1280, 860)
+    qapp.processEvents()
+
+    for component_id in ("panel.pilot.depth", "panel.pilot.lights", "panel.home.branch"):
+        shell.open_component(registry.BY_ID[component_id], window)
+    qapp.processEvents()
+
+    placements = [tile.placement for tile in window.tiles]
+    assert len(placements) == 3
+    for i, first in enumerate(placements):
+        for second in placements[i + 1 :]:
+            assert not grid.intersects(first, second)
+    # At least two of them fit side by side -- the whole point of the change.
+    assert len({p.row for p in placements}) < len(placements)
+    window.close()
+
+
+def test_closing_a_tile_removes_the_component_and_releases_its_pollers(qapp):
+    shell = _shell(qapp)
+    window = shell.new_window()
+    record = shell.open_component(registry.BY_ID["screen.logs"], window)
+    qapp.processEvents()
+
+    record["tile"].request_close()
+    qapp.processEvents()
+
+    assert shell.instances["screen.logs"] == []
+    assert window.tiles == []
+    # Reopening must work cleanly, which is what the X button removing it for real buys.
+    assert shell.open_component(registry.BY_ID["screen.logs"], window) is not None
+    window.close()
+
+
+def test_single_instance_component_is_refused_and_brought_to_front(qapp):
+    shell = _shell(qapp)
+    window = shell.new_window()
+    pilot = registry.BY_ID["screen.pilot"]
+
+    first = shell.open_component(pilot, window)
+    second_window = shell.new_window()
+    refused = shell.open_component(pilot, second_window)
+
+    assert first is not None
+    assert refused is None
+    assert len(shell.instances["screen.pilot"]) == 1
+    assert "already open elsewhere" in second_window.statusBar().currentMessage()
+    assert "scrolled into view" in second_window.statusBar().currentMessage()
+    second_window.close()
+    window.close()
+
+
+def test_duplicable_component_can_be_opened_twice(qapp):
+    shell = _shell(qapp)
+    window = shell.new_window()
+    graphs = registry.BY_ID["screen.graphs"]
+
+    first = shell.open_component(graphs, window)
+    second = shell.open_component(graphs, shell.new_window())
+
+    assert first is not None and second is not None
+    assert len(shell.instances["screen.graphs"]) == 2
+    # Distinct object names are what lets a preset restore both.
+    assert first["tile"].objectName() != second["tile"].objectName()
+    for w in list(shell.windows):
+        w.close()
+
+
+def test_hub_shuts_down_only_when_the_last_window_closes(qapp):
+    shell = _shell(qapp)
+    first = shell.new_window()
+    second = shell.new_window()
+
+    first.close()
+
+    # The old MainWindow.closeEvent called hub.shutdown() unconditionally -- with two windows
+    # that would have killed every service while the second window was still driving them.
+    assert shell.hub.shutdown_calls == 0
+
+    second.close()
+
+    assert shell.hub.shutdown_calls == 1
+
+
+def test_reveal_brings_an_open_component_to_front_instead_of_duplicating(qapp):
+    shell = _shell(qapp)
+    window = shell.new_window()
+    logs = registry.BY_ID["screen.logs"]
+    opened = shell.open_component(logs, window)
+
+    revealed = shell.reveal("Logs", window)
+
+    assert revealed is opened
+    assert len(shell.instances["screen.logs"]) == 1
+    window.close()
+
+
+def test_reveal_opens_a_component_that_is_not_yet_placed(qapp):
+    shell = _shell(qapp)
+    window = shell.new_window()
+
+    revealed = shell.reveal("Config", window)
+
+    assert revealed is not None
+    assert len(shell.instances["screen.config"]) == 1
+    window.close()
+
+
+# --- workspace presets --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def workspace_store(tmp_path, monkeypatch):
+    """Point the preset file at a throwaway dir so tests never touch the real data directory."""
+    from desktop import logic
+    from lib.json_data_handler import JSONDataHandler
+
+    monkeypatch.setattr(logic, "workspace_handler", JSONDataHandler(file_path=tmp_path / "workspaces.json"))
+    return logic
+
+
+def test_capture_and_reload_preset_round_trips_a_two_window_layout(qapp, workspace_store):
+    shell = _shell(qapp)
+    first = shell.new_window()
+    shell.open_component(registry.BY_ID["screen.pilot"], first)
+    shell.open_component(registry.BY_ID["screen.graphs"], first)
+    shell.open_component(registry.BY_ID["screen.graphs"], first)  # duplicable -> two instances
+    second = shell.new_window()
+    shell.open_component(registry.BY_ID["screen.logs"], second)
+    qapp.processEvents()
+    captured = {r["tile"].objectName(): _cells(r["tile"]) for rs in shell.instances.values() for r in rs}
+
+    ok, _message = workspace_store.save_workspace_preset("Dive rig", shell.capture_preset())
+    assert ok
+    assert shell.load_preset("Classic")
+    qapp.processEvents()
+    assert len(shell.windows) == 1
+
+    assert shell.load_preset("Dive rig")
+    qapp.processEvents()
+
+    assert len(shell.windows) == 2
+    assert len(shell.instances["screen.graphs"]) == 2
+    assert len(shell.instances["screen.pilot"]) == 1
+    # Distinct object names are what let a preset tell the two copies apart.
+    names = {r["tile"].objectName() for r in shell.instances["screen.graphs"]}
+    assert len(names) == 2
+    # Cells, not just membership: a layout that reloads in different places is not restored.
+    restored = {r["tile"].objectName(): _cells(r["tile"]) for rs in shell.instances.values() for r in rs}
+    assert restored == captured
+    for window in list(shell.windows):
+        window.close()
+
+
+def _cells(tile):
+    p = tile.placement
+    return (p.col, p.row, p.cols, p.rows)
+
+
+def test_preset_without_cells_still_opens_its_components(qapp, workspace_store):
+    """A version-1 preset (the dock shell's) carries no cells. It must auto-place, not fail."""
+    shell = _shell(qapp)
+    v1 = {"version": 1, "windows": [{"components": [{"id": "screen.logs"}, {"id": "screen.home"}]}]}
+    workspace_store.save_workspace_preset("Old", v1)
+
+    assert shell.load_preset("Old")
+    qapp.processEvents()
+
+    assert len(shell.windows[0].tiles) == 2
+    placements = [t.placement for t in shell.windows[0].tiles]
+    assert not grid.intersects(placements[0], placements[1])
+    for window in list(shell.windows):
+        window.close()
+
+
+def test_preset_naming_a_removed_component_still_loads(qapp, workspace_store):
+    """A layout saved before a screen was decomposed must degrade, not crash."""
+    shell = _shell(qapp)
+    stale = {"windows": [{"components": [{"id": "screen.pilot"}, {"id": "screen.gone"}]}]}
+    workspace_store.save_workspace_preset("Stale", stale)
+
+    assert shell.load_preset("Stale")
+    qapp.processEvents()
+
+    assert len(shell.instances["screen.pilot"]) == 1
+    assert "screen.gone" not in shell.instances
+    for window in list(shell.windows):
+        window.close()
+
+
+def test_unknown_preset_falls_back_to_an_empty_workspace_rather_than_no_windows(qapp, workspace_store):
+    """The saved 'last layout' can name a preset the operator has since deleted."""
+    shell = _shell(qapp)
+
+    assert shell.load_preset("never saved") is False
+
+    assert len(shell.windows) == 1
+    assert shell.windows[0].tiles == []
+    for window in list(shell.windows):
+        window.close()
+
+
+def test_no_saved_layout_opens_an_empty_workspace(qapp, workspace_store):
+    """A fresh install: load_last_workspace() returns "" and must still leave one window up."""
+    shell = _shell(qapp)
+
+    assert workspace_store.load_last_workspace() == ""
+    assert shell.load_preset(workspace_store.load_last_workspace()) is False
+
+    assert len(shell.windows) == 1
+    assert shell.windows[0].tiles == []
+    for window in list(shell.windows):
+        window.close()
+
+
+def test_classic_preset_stacks_the_ten_screens_full_width(qapp, workspace_store):
+    """Classic is no longer the default, but it must still load — and not overlap."""
+    shell = _shell(qapp)
+
+    assert shell.load_preset("Classic")
+    qapp.processEvents()
+
+    tiles = shell.windows[0].tiles
+    assert len(tiles) == len(registry.SCREEN_COMPONENTS)
+    assert all(tile.placement.cols == grid.COLUMNS for tile in tiles)
+    rows = sorted(tile.placement.row for tile in tiles)
+    assert rows == sorted(set(rows))  # stacked, one per band
+    for window in list(shell.windows):
+        window.close()
+
+
+def test_classic_preset_is_reserved(qapp, workspace_store):
+    ok, message = workspace_store.save_workspace_preset("Classic", {"windows": []})
+    assert ok is False
+    assert "built in" in message
+
+    ok, message = workspace_store.delete_workspace_preset("Classic")
+    assert ok is False
+    assert "Classic" in workspace_store.load_workspace_presets()
+
+
+# --- decomposed panels: Graphs is the worked reference -------------------------------------------
+
+
+def test_graph_charts_share_one_poller_and_release_it_together(qapp):
+    """Six charts on one poller key is what makes duplicating a chart into another dock free."""
+    from desktop.screens.graphs import GraphsScreen
+
+    hub = FakeHub()
+    screen = GraphsScreen(hub)
+    poller = hub.pollers["graphs.sample"]
+
+    assert len(poller.updated.slots) == 6
+
+    screen.set_active(True)
+    assert poller._subscribers == 6
+
+    screen.set_active(False)
+    assert poller._subscribers == 0
+
+
+def test_chart_panel_narrows_a_shared_sample_to_its_own_channel(qapp):
+    from desktop.screens.graphs import ChartPanel
+
+    hub = FakeHub()
+    yaw = ChartPanel(hub, "yaw", "Yaw", "deg", "#0dcaf0", True)
+    roll_rate = ChartPanel(hub, "rr", "Roll Rate", "deg/s", "#198754", False)
+    yaw.set_active(True)
+    roll_rate.set_active(True)
+
+    hub.pollers["graphs.sample"].updated.emit({"imu": {"yaw": 12.5, "rr": -2.0}, "setpoint": {"yaw": 10.0}})
+
+    _xs, ys, setpoints = yaw.samples()
+    assert ys == [12.5]
+    assert setpoints == [10.0]
+    _xs, rate_ys, rate_sp = roll_rate.samples()
+    assert rate_ys == [-2.0]
+    assert rate_sp == []  # rate charts carry no PID setpoint at all
+
+
+def test_read_only_screen_keeps_its_composite_component(qapp):
+    """Graphs has no hardware writer, so the all-six grid stays openable next to single charts."""
+    assert "screen.graphs" in registry.BY_ID
+    chart_ids = [c.id for c in registry.COMPONENTS if c.category == "Graphs"]
+    assert len(chart_ids) == 6
+    assert all(registry.BY_ID[cid].duplicable for cid in chart_ids)
+
+
+# --- composite/panel single-instance guard --------------------------------------------------------
+# The hazard: a screen and one of its own panels have DIFFERENT component ids, so an id-only guard
+# would happily give you two live widgets driving the same actuator. Component.owns closes that.
+
+
+def test_opening_a_screen_reserves_its_writer_panels(qapp):
+    shell = _shell(qapp)
+    window = shell.new_window()
+
+    shell.open_component(registry.BY_ID["screen.pilot"], window)
+    refused = shell.open_component(registry.BY_ID["panel.pilot.manipulator"], window)
+
+    assert refused is None
+    assert "panel.pilot.manipulator" not in shell.instances or not shell.instances["panel.pilot.manipulator"]
+    assert "already open in" in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_opening_a_writer_panel_reserves_its_parent_screen(qapp):
+    """The guard has to work in both directions, not just screen-first."""
+    shell = _shell(qapp)
+    window = shell.new_window()
+
+    shell.open_component(registry.BY_ID["panel.pilot.manipulator"], window)
+    refused = shell.open_component(registry.BY_ID["screen.pilot"], window)
+
+    assert refused is None
+    assert not shell.instances.get("screen.pilot")
+    window.close()
+
+
+def test_read_only_screen_and_its_panels_coexist(qapp):
+    """Nothing in Graphs writes, so the grid and a single chart may be open at once."""
+    shell = _shell(qapp)
+    window = shell.new_window()
+
+    grid = shell.open_component(registry.BY_ID["screen.graphs"], window)
+    chart = shell.open_component(registry.BY_ID["panel.graphs.yaw"], window)
+
+    assert grid is not None
+    assert chart is not None
+    window.close()
+
+
+def test_component_ids_are_unique(qapp):
+    ids = [c.id for c in registry.COMPONENTS]
+    assert len(ids) == len(set(ids)), [i for i in ids if ids.count(i) > 1]
+
+
+def test_every_non_duplicable_panel_is_owned_by_a_screen(qapp):
+    """A writer panel nobody claims would be openable alongside its screen, unguarded."""
+    owned = {claim for c in registry.SCREEN_COMPONENTS for claim in c.owns}
+    orphans = [
+        c.id
+        for c in registry.COMPONENTS
+        if c.id.startswith("panel.") and not c.duplicable and c.id not in owned and c.category != "Workspace"
+    ]
+    assert orphans == [], orphans
+
+
+def test_owns_only_references_real_components(qapp):
+    unknown = [claim for c in registry.COMPONENTS for claim in c.owns if claim not in registry.BY_ID]
+    assert unknown == [], unknown

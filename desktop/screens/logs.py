@@ -14,6 +14,12 @@ list is redrawn from the retained local cache instead of duplicating or losing r
 
 Clear wipes the QTextEdit and the local render cache, but never `LogStreamReceiver`'s buffer or
 the on-disk log — every line is still recorded, and new lines keep arriving normally.
+
+The whole screen is effectively one panel (toolbar + text view), so it is a thin `ScreenBase`
+wrapper around `LogTailPanel`. The panel is read-only (`duplicable=True`) and works standalone in
+its own dock; `LogsScreen` keeps the old attribute names (`_view`, `_toolbar_widgets`,
+`_read_recent`, `_on_recent`, ...) as delegates because `tests/test_desktop_screens.py` calls them
+directly on the screen.
 """
 
 from __future__ import annotations
@@ -31,7 +37,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from desktop.screens.base import ScreenBase
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 
 POLL_INTERVAL_MS = 400
 #: Matches LogStreamReceiver's default max_entries — no point asking for more than it can hold.
@@ -54,11 +61,19 @@ _LEVEL_COLOR = {
 }
 
 
-class LogsScreen(ScreenBase):
+class LogTailPanel(PanelBase):
+    """Toolbar + read-only text view over the log ring buffer. Safe to duplicate — it only reads.
+
+    `notify` is an optional forward: `LogsScreen` passes its own `notify` so operator-facing
+    messages (e.g. "no receiver") land on the screen's single notice widget; standalone in a
+    dock, it falls back to its own.
+    """
+
     title = "Logs"
 
-    def __init__(self, hub, parent=None):
+    def __init__(self, hub, notify=None, parent=None):
         super().__init__(hub, parent)
+        self._forward_notify = notify
 
         #: Local cache of entries rendered so far, used to re-render on a filter change.
         self._known: list[dict] = []
@@ -66,6 +81,7 @@ class LogsScreen(ScreenBase):
         self._last_seen = None
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.notice_widget)
         layout.addLayout(self._build_toolbar())
 
@@ -79,6 +95,12 @@ class LogsScreen(ScreenBase):
             self.notify("Log stream unavailable — no receiver.")
         else:
             self.watch("logs.recent", self._read_recent, POLL_INTERVAL_MS, self._on_recent)
+
+    def notify(self, message):
+        if self._forward_notify is not None:
+            self._forward_notify(message)
+        else:
+            super().notify(message)
 
     # --- UI construction ---------------------------------------------------
 
@@ -207,3 +229,50 @@ class LogsScreen(ScreenBase):
         """
         self._view.clear()
         self._known = []
+
+
+class LogsScreen(ScreenBase):
+    title = "Logs"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+
+        self._panel = LogTailPanel(hub, notify=self.notify)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._panel, 1)
+
+    # --- back-compat delegates -------------------------------------------------------------
+    # tests/test_desktop_screens.py asserts on these names directly; keep them stable.
+
+    @property
+    def _view(self):
+        return self._panel._view
+
+    @property
+    def _known(self):
+        return self._panel._known
+
+    @property
+    def _toolbar_widgets(self):
+        return self._panel._toolbar_widgets
+
+    def _read_recent(self):
+        return self._panel._read_recent()
+
+    def _on_recent(self, entries):
+        self._panel._on_recent(entries)
+
+
+#: Read-only — the log tail has no write hazard, so it stays duplicable.
+COMPONENTS = [
+    Component(
+        id="panel.logs.tail",
+        title="Logs: Tail",
+        factory=LogTailPanel,
+        category="Logs",
+        duplicable=True,
+        order=0,
+    ),
+]

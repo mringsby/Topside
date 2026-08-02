@@ -3,17 +3,31 @@
 Ports `/debug` (`debug.html` + `debug.js`). Shard agents: read this file before writing yours.
 It is deliberately small and deliberately shows every pattern the other screens need:
 
-  * a shared poller driving a read-only view          -> _on_status
-  * a fast local send loop that is NOT a poller       -> _send_timer
-  * a blocking call pushed off the GUI thread         -> _clear_override
-  * graceful degradation when a service is absent     -> _refresh_enabled
+  * a shared poller driving a read-only view          -> SendsLogPanel._on_status
+  * a fast local send loop that is NOT a poller       -> OverridePanel._send_timer
+  * a blocking call pushed off the GUI thread         -> OverridePanel._clear_override
+  * graceful degradation when a service is absent     -> OverridePanel._refresh_enabled
   * non-blocking error reporting, never QMessageBox   -> notify()
-  * a screen that must release state when hidden      -> on_deactivate
+  * a screen that must release state when hidden      -> OverridePanel.on_deactivate
 
 Behavioural parity with debug.js: sliders are integers -100..100 shown as +/-1.00, double-click
 zeroes an axis, override sends at 20 Hz (SEND_INTERVAL_MS = 50) while active, status refreshes
 every 500 ms, and every exit path (Disable, STOP ALL, leaving the screen) zeroes the sliders and
 clears the override.
+
+Decomposed into two dockable panels:
+
+  * `OverridePanel` — the slider grid and its controls. WRITES thruster commands via
+    `Controller.set_debug_override`, so it stays single-instance (`duplicable=False`): two live
+    copies would fight over the killed -> override -> joystick priority in `Controller.update()`,
+    which is a hardware-safety bug, not a UI one.
+  * `SendsLogPanel` — the read-only "Topside Sends" status view. `duplicable=True`.
+
+`DebugScreen` composes both and keeps its old attribute names/methods (`_override_active`,
+`_enable_override()`, `_stop_all()`, ...) as thin delegates, because `tests/test_desktop_screens.py`
+calls them directly on the screen. Both panels forward `notify()` to the screen's own notice
+widget when embedded (via the `notify=` constructor arg), and fall back to their own when opened
+standalone in a dock.
 """
 
 import json
@@ -31,7 +45,8 @@ from PySide6.QtWidgets import (
 )
 
 from desktop import logic
-from desktop.screens.base import ScreenBase
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 
 SEND_INTERVAL_MS = 50
 STATUS_INTERVAL_MS = 500
@@ -86,11 +101,33 @@ class AxisSlider(QGroupBox):
         self._value_label.setText(f"{value:+.2f}" if abs(value) > 0.005 else "0.00")
 
 
-class DebugScreen(ScreenBase):
-    title = "Debug"
+def rov_status(hub):
+    """Replaces GET /api/rov/status. Cheap in-memory reads only.
 
-    def __init__(self, hub, parent=None):
+    Module-level so any panel can feed itself from the shared "rov.status" poller.
+    """
+    udp_rx, udp_err = hub.resource.get_udp_counters() if hub.resource else (0, 0)
+    return {
+        "command": hub.bitmask.get_command() if hub.bitmask else {},
+        "uplink": hub.bitmask.get_uplink_status() if hub.bitmask else {},
+        "resource": {"udp_rx_count": udp_rx, "udp_rx_errors": udp_err},
+    }
+
+
+class OverridePanel(PanelBase):
+    """The 6-slider override grid plus its Enable/Disable/Zero/STOP controls.
+
+    WRITES thruster commands, so this must never be duplicated live — see `duplicable=False` on
+    its `Component` below. `notify` is an optional forward: `DebugScreen` passes its own `notify`
+    so operator-facing messages land on the screen's single notice widget; standalone in a dock,
+    it falls back to its own.
+    """
+
+    title = "Debug Override"
+
+    def __init__(self, hub, notify=None, parent=None):
         super().__init__(hub, parent)
+        self._forward_notify = notify
         self._override_active = False
 
         self._sliders = {}
@@ -120,46 +157,24 @@ class DebugScreen(ScreenBase):
         controls.addWidget(self._status_badge)
         controls.addWidget(self._btn_stop)
 
-        self._status_view = QPlainTextEdit()
-        self._status_view.setReadOnly(True)
-        self._status_view.setPlainText("Loading...")
-
-        override_box = QGroupBox("Debug Override")
-        override_layout = QVBoxLayout(override_box)
-        override_layout.addLayout(controls)
-        override_layout.addLayout(grid)
-
-        sends_box = QGroupBox("Topside Sends")
-        sends_layout = QVBoxLayout(sends_box)
-        sends_layout.addWidget(self._status_view)
-
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.notice_widget)
-        layout.addWidget(override_box)
-        layout.addWidget(sends_box, 1)
+        layout.addLayout(controls)
+        layout.addLayout(grid)
 
         # A plain QTimer, not a hub poller: this is a local write loop, not shared read state.
         self._send_timer = QTimer(self)
         self._send_timer.setInterval(SEND_INTERVAL_MS)
         self._send_timer.timeout.connect(self._send_override)
 
-        self.watch("rov.status", self._rov_status, STATUS_INTERVAL_MS, self._on_status)
         self._refresh_enabled()
 
-    # --- data ---------------------------------------------------------------
-
-    def _rov_status(self):
-        """Replaces GET /api/rov/status. Cheap in-memory reads only."""
-        hub = self.hub
-        udp_rx, udp_err = hub.resource.get_udp_counters() if hub.resource else (0, 0)
-        return {
-            "command": hub.bitmask.get_command() if hub.bitmask else {},
-            "uplink": hub.bitmask.get_uplink_status() if hub.bitmask else {},
-            "resource": {"udp_rx_count": udp_rx, "udp_rx_errors": udp_err},
-        }
-
-    def _on_status(self, status):
-        self._status_view.setPlainText(json.dumps(status, indent=2))
+    def notify(self, message):
+        if self._forward_notify is not None:
+            self._forward_notify(message)
+        else:
+            super().notify(message)
 
     # --- override -----------------------------------------------------------
 
@@ -233,9 +248,111 @@ class DebugScreen(ScreenBase):
     def _on_error(self, message):
         self.notify(f"Debug override: {message}")
 
-    # --- lifecycle ----------------------------------------------------------
+    # --- lifecycle ------------------------------------------------------------
 
     def on_deactivate(self):
         """Never leave an override running behind the operator's back."""
         if self._override_active:
             self._stop_all()
+
+
+class SendsLogPanel(PanelBase):
+    """Read-only "Topside Sends" status view. Safe to duplicate — it only ever reads."""
+
+    title = "Topside Sends"
+
+    def __init__(self, hub, notify=None, parent=None):
+        super().__init__(hub, parent)
+        self._forward_notify = notify
+
+        self._status_view = QPlainTextEdit()
+        self._status_view.setReadOnly(True)
+        self._status_view.setPlainText("Loading...")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._status_view, 1)
+
+        self.watch("rov.status", lambda: rov_status(self.hub), STATUS_INTERVAL_MS, self._on_status)
+
+    def notify(self, message):
+        if self._forward_notify is not None:
+            self._forward_notify(message)
+        else:
+            super().notify(message)
+
+    def _on_status(self, status):
+        self._status_view.setPlainText(json.dumps(status, indent=2))
+
+
+class DebugScreen(ScreenBase):
+    title = "Debug"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+
+        self._override_panel = OverridePanel(hub, notify=self.notify)
+        override_box = QGroupBox("Debug Override")
+        override_layout = QVBoxLayout(override_box)
+        override_layout.addWidget(self._override_panel)
+
+        self._sends_panel = SendsLogPanel(hub, notify=self.notify)
+        sends_box = QGroupBox("Topside Sends")
+        sends_layout = QVBoxLayout(sends_box)
+        sends_layout.addWidget(self._sends_panel)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(override_box)
+        layout.addWidget(sends_box, 1)
+
+        # No watch() of its own: each panel polls (or ticks) itself, and PanelBase.set_active
+        # cascades activation down to them automatically.
+
+    # --- back-compat delegates -------------------------------------------------------------
+    # tests/test_desktop_screens.py asserts on these names directly; keep them stable.
+
+    @property
+    def _override_active(self):
+        return self._override_panel._override_active
+
+    @property
+    def _sliders(self):
+        return self._override_panel._sliders
+
+    @property
+    def _send_timer(self):
+        return self._override_panel._send_timer
+
+    @property
+    def _status_view(self):
+        return self._sends_panel._status_view
+
+    def _enable_override(self):
+        self._override_panel._enable_override()
+
+    def _stop_all(self):
+        self._override_panel._stop_all()
+
+
+#: The override grid WRITES thruster commands, so it must stay single-instance. The sends log
+#: only ever reads, so it is free to duplicate into as many docks as the operator wants.
+COMPONENTS = [
+    Component(
+        id="panel.debug.override",
+        title="Debug: Override Sliders",
+        factory=OverridePanel,
+        category="Debug",
+        duplicable=False,
+        order=0,
+    ),
+    Component(
+        id="panel.debug.sends",
+        title="Debug: Topside Sends",
+        factory=SendsLogPanel,
+        category="Debug",
+        duplicable=True,
+        order=1,
+    ),
+]

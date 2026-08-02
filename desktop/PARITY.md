@@ -79,8 +79,7 @@ through `ServiceHub.call_async()`, never be invoked directly from a slot:
 | 7 | `/config` | `configuration.js` (317) | `screens/config.py` | D |
 | 8 | `/connection` | `connection.js` (126) | `screens/connection.py` | D |
 | 9 | `/ip-camera`, `/Camera2` | `ip_camera.js` (181) | `screens/ip_camera.py` | D |
-| 10 | `/Camera1` | — | folded into `widgets/camera.py` | E |
-| 11 | `/docs`, `/docs/swagger.yml` | — | **dropped** — see §5 | — |
+| 10 | `/docs`, `/docs/swagger.yml` | — | **dropped** — see §5 | — |
 
 `manipulator.js` is loaded by both `pilot.html` and `tooling.html`; it becomes one reusable
 `widgets/manipulator.py` used by both screens. Shard C owns it.
@@ -105,10 +104,10 @@ No template references these and no route renders them. Confirmed by grepping ev
 | Route | Replacement |
 |---|---|
 | `/rpi_video_feed` | `widgets/camera.py` polls `hub.rpi_camera.get_latest_jpeg_and_seq()` |
-| `/video_feed` | same, `hub.default_camera` |
+| `/video_feed` | **removed** — local camera feature dropped |
 | `/ip_video_feed` | same, `hub.ip_camera` |
 | `GET /api/rpi_camera/status` | `hub.rpi_camera.get_status()` |
-| `GET /api/camera/status` | `hub.default_camera.get_status()` |
+| `GET /api/camera/status` | **removed** — local camera feature dropped |
 | `GET /api/ip_camera/status` | `hub.ip_camera.get_status()` |
 
 The MJPEG multipart framing and its no-cache headers disappear — the widget reads the JPEG buffer

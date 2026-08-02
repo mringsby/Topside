@@ -15,6 +15,8 @@ ever built). That means this file needs no `QApplication` at all.
 
 from types import SimpleNamespace
 
+import pytest
+
 from desktop import logic, services
 from desktop.screens.pid_tuning import PidTuningScreen
 from lib.json_data_handler import JSONDataHandler
@@ -422,3 +424,115 @@ def test_reassign_ip_camera_tears_down_and_rebuilds(monkeypatch, tmp_path):
 
     # Persisted so a restart comes back up on the reassigned IP.
     assert logic.get_ip_camera_config()["active_ip"] == "10.77.0.9"
+
+
+# --- theme persistence (test_theme_load_defaults_and_round_trips) -------------------------------
+
+
+def test_load_theme_defaults_to_dark_when_section_absent(monkeypatch, tmp_path):
+    config_handler = JSONDataHandler(file_path=tmp_path / "config.json")
+    monkeypatch.setattr(logic, "config_handler", config_handler)
+
+    assert logic.load_theme() == "dark"
+
+
+def test_save_theme_and_load_theme_round_trip(monkeypatch, tmp_path):
+    config_handler = JSONDataHandler(file_path=tmp_path / "config.json")
+    monkeypatch.setattr(logic, "config_handler", config_handler)
+
+    logic.save_theme("light")
+
+    assert logic.load_theme() == "light"
+
+
+def test_save_theme_rejects_unknown_name(monkeypatch, tmp_path):
+    config_handler = JSONDataHandler(file_path=tmp_path / "config.json")
+    monkeypatch.setattr(logic, "config_handler", config_handler)
+
+    with pytest.raises(ValueError):
+        logic.save_theme("solarized")
+
+
+# --- workspace layout presets (Workspaces panel persistence) ------------------------------------
+
+
+def test_save_workspace_preset_round_trips(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    preset = {"windows": [{"layout": "tabbed", "components": [{"id": "screen.home"}]}]}
+    ok, message = logic.save_workspace_preset("My Layout", preset)
+
+    assert ok is True
+    assert "My Layout" in message
+    assert logic.load_workspace_presets()["My Layout"] == preset
+
+
+def test_load_workspace_presets_always_includes_classic(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    presets = logic.load_workspace_presets()
+
+    assert logic.CLASSIC_PRESET_NAME in presets
+    assert presets[logic.CLASSIC_PRESET_NAME] == logic.CLASSIC_PRESET
+
+
+def test_save_workspace_preset_refuses_classic_name(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    ok, message = logic.save_workspace_preset(logic.CLASSIC_PRESET_NAME, {"windows": []})
+
+    assert ok is False
+    assert message
+    assert logic.load_workspace_presets()[logic.CLASSIC_PRESET_NAME] == logic.CLASSIC_PRESET
+
+
+def test_delete_workspace_preset_refuses_classic_name(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    ok, message = logic.delete_workspace_preset(logic.CLASSIC_PRESET_NAME)
+
+    assert ok is False
+    assert message
+    assert logic.CLASSIC_PRESET_NAME in logic.load_workspace_presets()
+
+
+def test_save_workspace_preset_rejects_invalid_name(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    ok, message = logic.save_workspace_preset("bad/name!", {"windows": []})
+
+    assert ok is False
+    assert message
+    assert "bad/name!" not in logic.load_workspace_presets()
+
+
+def test_delete_workspace_preset_unknown_name_returns_false(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    ok, message = logic.delete_workspace_preset("Nope")
+
+    assert ok is False
+    assert message
+
+
+def test_load_last_workspace_defaults_to_empty(monkeypatch, tmp_path):
+    """A fresh install opens an empty workspace, not the ten screens it then has to close."""
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    assert logic.load_last_workspace() == ""
+
+
+def test_save_last_workspace_round_trips(monkeypatch, tmp_path):
+    workspace_handler = JSONDataHandler(file_path=tmp_path / "workspaces.json")
+    monkeypatch.setattr(logic, "workspace_handler", workspace_handler)
+
+    logic.save_last_workspace("My Layout")
+
+    assert logic.load_last_workspace() == "My Layout"

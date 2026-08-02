@@ -26,6 +26,15 @@ Two behaviours are deliberately NOT literal ports, both because the shard contra
 
 Every blocking MCU/network call (`request_pid_gains`, `send_pid_gains`, `send_override`,
 `clear_override`) goes through `hub.call_async`, never directly from a slot.
+
+Decomposed into six dockable `PanelBase` panels (one per former `_build_*` method). The two
+read-only panels (`ReadoutsPanel`, `TelemetryPanel`) are fully self-sufficient — they poll for
+their own data via module-level getters, exactly like `graphs.py`'s `ChartPanel` — which is why
+they are the only panels marked `duplicable=True`. The four panels that can write to the vehicle
+(`ActionBarPanel`, `OverridePanel`, `SetpointsPanel`, `GainsPanel`) stay `duplicable=False` and
+delegate every action back to `PidTuningScreen` when composed on this screen; opened standalone
+(no screen to delegate to) their controls are disabled with an explanatory notice rather than
+duplicating hardware-writing logic in a second place.
 """
 
 import json
@@ -51,8 +60,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from desktop import logic
-from desktop.screens.base import ScreenBase
+from desktop import logic, theme
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 from desktop.screens.debug import AXIS_LABELS, AxisSlider
 from lib.pid_config_client import request_pid_gains, send_pid_gains
 
@@ -66,115 +76,294 @@ DELETE_ARM_TIMEOUT_MS = 5000
 ROT_AXIS_LABELS = [("roll", "Roll"), ("pitch", "Pitch"), ("yaw", "Yaw")]
 GAIN_KEYS = ("kp", "ki", "kd")
 
-_BADGE_COLORS = {
-    "secondary": ("#6c757d", "white"),
-    "success": ("#198754", "white"),
-    "danger": ("#dc3545", "white"),
-    "warning": ("#c98a00", "black"),
-    "info": ("#0dcaf0", "black"),
+#: Shown on a write panel's controls when it is opened standalone (no PidTuningScreen to
+#: delegate the action to). Duplicating hardware-writing logic into a second code path is the
+#: exact hazard `duplicable=False` exists to avoid, so a standalone write panel disables its
+#: controls instead of reimplementing them.
+_STANDALONE_NOTICE = "Open the PID Tuning screen to use this control."
+
+#: variant -> (theme token key, contrasting text colour for a solid-fill pill background).
+#: Proxied through `theme.token()` lazily (see desktop/theme.py) rather than a frozen dict, so a
+#: theme switch after import is picked up.
+_BADGE_TEXT = {
+    "secondary": "white",
+    "success": "white",
+    "danger": "white",
+    "warning": "black",
+    "info": "black",
 }
 
-_FEEDBACK_COLORS = {
-    "success": "#198754",
-    "danger": "#dc3545",
-    "warning": "#c98a00",
-    "info": "#0dcaf0",
-    "light": "",
-}
+
+class _BadgeColorMap:
+    def __getitem__(self, variant):
+        return theme.token(variant), _BADGE_TEXT[variant]
+
+    def get(self, variant, default=None):
+        try:
+            return self[variant]
+        except KeyError:
+            return default
 
 
-class PidTuningScreen(ScreenBase):
-    title = "PID Tuning"
+_BADGE_COLORS = _BadgeColorMap()
 
-    def __init__(self, hub, parent=None):
+
+class _FeedbackColorMap:
+    _KEYS = {"success", "danger", "warning", "info"}
+
+    def get(self, variant, default=""):
+        if variant not in self._KEYS:
+            return default
+        return theme.token(variant)
+
+
+_FEEDBACK_COLORS = _FeedbackColorMap()
+
+
+def _set_badge(label, text, variant="secondary"):
+    bg, fg = _BADGE_COLORS.get(variant, _BADGE_COLORS["secondary"])
+    label.setText(text)
+    label.setStyleSheet(f"background-color:{bg}; color:{fg}; padding:2px 10px; border-radius:4px; font-weight:600;")
+
+
+def _make_badge(text, variant):
+    label = QLabel()
+    _set_badge(label, text, variant)
+    return label
+
+
+def _make_status_card(title, value_widget):
+    box = QGroupBox()
+    v = QVBoxLayout(box)
+    v.addWidget(QLabel(f"<small>{title}</small>"))
+    v.addWidget(value_widget)
+    return box
+
+
+def _disable_for_standalone(panel, widgets, message=_STANDALONE_NOTICE):
+    """A write panel opened without a host screen has nothing safe to delegate its actions to.
+
+    Disabling the controls (rather than reimplementing the hardware-writing logic a second
+    time) is the deliberate choice here — see the module docstring.
+    """
+    for widget in widgets:
+        widget.setEnabled(False)
+    panel.notify(message)
+
+
+# --- pure calculations shared by ReadoutsPanel and TelemetryPanel --------------------------
+# Both panels show the same per-axis numbers (position/setpoint/error, plus mode/output/gains
+# in the table); kept as plain functions so neither panel duplicates the other's math.
+
+
+def _safe_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _fmt(value, digits=2):
+    value = _safe_float(value)
+    return "--" if value is None else f"{value:.{digits}f}"
+
+
+def _telemetry_setpoint(telemetry, axis, local_setpoints, pid_enabled):
+    from_telem = _safe_float((telemetry.get("setpoint") or {}).get(axis))
+    from_local = local_setpoints.get(axis)
+    if pid_enabled and from_telem is not None:
+        return from_telem
+    if from_local is not None:
+        return from_local
+    return from_telem
+
+
+def _axis_measurement(telemetry, imu, axis):
+    from_telem = _safe_float((telemetry.get("measurement") or {}).get(axis))
+    if from_telem is not None:
+        return from_telem
+    return _safe_float(imu.get(axis))
+
+
+def _axis_error(telemetry, axis, setpoint, position):
+    from_telem = _safe_float((telemetry.get("error") or {}).get(axis))
+    if from_telem is not None:
+        return from_telem
+    if setpoint is None or position is None:
+        return None
+    if axis == "pitch":
+        return setpoint - position
+    return logic.normalize_angle_deg(setpoint - position)
+
+
+def _axis_output(telemetry, axis):
+    return _safe_float((telemetry.get("output") or {}).get(axis))
+
+
+def _axis_gains_text(telemetry, axis):
+    gains = (telemetry.get("gains") or {}).get(axis)
+    if not gains:
+        return "--"
+    return f"P {_fmt(gains.get('kp'))} I {_fmt(gains.get('ki'))} D {_fmt(gains.get('kd'))}"
+
+
+def _axis_mode(telemetry, axis):
+    if not telemetry:
+        return "--"
+    flags = telemetry.get("flags") or {}
+    if flags.get("timeout"):
+        return "TIMEOUT"
+    bit = 1 << logic.CONTROL_AXES.index(axis)
+    if (telemetry.get("override_mask") or 0) & bit:
+        return "OVR"
+    if (telemetry.get("pid_active_mask") or 0) & bit:
+        return "PID"
+    return "LEGACY" if telemetry.get("protocol_version") == 1 else "PASS"
+
+
+def _control_path_text(path, killed):
+    if killed:
+        return "Controls locked"
+    if path == "Override Controls":
+        return "Override sliders"
+    if path == "PS4":
+        return "PS4 Controller"
+    return path or "PS4 Controller"
+
+
+def _debug_payload(status, control, telemetry):
+    control = control or {}
+    uplink = status.get("uplink") or {}
+    telemetry = telemetry or {}
+    return {
+        "control_path": _control_path_text(control.get("control_path"), control.get("killed") is True),
+        "pid_enabled": control.get("pid_enabled"),
+        "active_setpoints": control.get("pid_setpoints"),
+        "manual_command_before_pid": control.get("manual_command_before_pid"),
+        "mcu_flags": telemetry.get("flags", {}),
+        "mcu_command_age_ms": telemetry.get("last_command_age_ms"),
+        "mcu_measurement": telemetry.get("measurement", {}),
+        "pid_output": telemetry.get("output", {}),
+        "pid_gains_mcu": telemetry.get("gains", {}),
+        "final_topside_command": status.get("command"),
+        "raw_payload": uplink.get("last_packet_hex"),
+        "timestamp": uplink.get("last_send_timestamp"),
+        "sequence": uplink.get("sequence"),
+        "link": {
+            "ack_age_ms": uplink.get("last_ack_age_ms"),
+            "watchdog_resends": uplink.get("watchdog_resends"),
+        },
+        "telemetry": {
+            "sequence": telemetry.get("sequence"),
+            "timestamp": telemetry.get("timestamp"),
+        },
+        "resource": status.get("resource"),
+    }
+
+
+# --- shared poller getters --------------------------------------------------------------
+# Module-level so several panels (and the screen) can watch the same key and share one timer.
+
+
+def read_control_state(hub):
+    ctrl = hub.controller
+    return ctrl.get_control_state() if ctrl else None
+
+
+def read_imu_telemetry(hub):
+    imu_stats = hub.imu.get_stats() if hub.imu else None
+    telemetry = hub.control_telem.get_latest() if hub.control_telem else None
+    return {"imu": imu_stats, "telemetry": telemetry}
+
+
+def read_rov_status(hub):
+    udp_rx, udp_err = hub.resource.get_udp_counters() if hub.resource else (0, 0)
+    ctrl = hub.controller
+    return {
+        "command": hub.bitmask.get_command() if hub.bitmask else {},
+        "uplink": hub.bitmask.get_uplink_status() if hub.bitmask else {},
+        "control_state": ctrl.get_control_state() if ctrl else {},
+        "resource": {"udp_rx_count": udp_rx, "udp_rx_errors": udp_err},
+    }
+
+
+# --- panels ------------------------------------------------------------------------------
+
+
+class ActionBarPanel(PanelBase):
+    """Control-path/PID-mode status cards plus the start/force-start/rearm/kill buttons.
+
+    Writes to the vehicle (start/stop PID, kill, rearm), so it stays single-instance
+    (`duplicable=False`). When composed on `PidTuningScreen` its buttons delegate to the
+    screen's existing handlers; opened standalone they are disabled (see module docstring).
+    """
+
+    def __init__(self, hub, screen=None, parent=None):
         super().__init__(hub, parent)
+        self.title = "PID Action Bar"
 
-        self._override_active = False
-        self._local_setpoints = {axis: None for axis in logic.ATTITUDE_AXES}
-        self._latest_imu = {}
-        self._latest_telemetry = None
-        self._latest_control_state = {}
-
-        root = QVBoxLayout(self)
-        root.addWidget(self.notice_widget)
-        root.addLayout(self._build_action_bar())
-        root.addLayout(self._build_readouts())
-
-        columns = QHBoxLayout()
-        columns.addWidget(self._build_left_stack(), 1)
-        columns.addWidget(self._build_right_stack(), 1)
-        root.addLayout(columns, 1)
-
-        # A plain QTimer, not a hub poller: this is a local write loop (matches debug.py).
-        self._send_timer = QTimer(self)
-        self._send_timer.setInterval(SEND_INTERVAL_MS)
-        self._send_timer.timeout.connect(self._send_override)
-
-        self.watch(
-            "pid.control_state", self._read_control_state, CONTROL_STATE_INTERVAL_MS, self._on_control_state_update
-        )
-        self.watch("pid.imu_telemetry", self._read_imu_telemetry, IMU_TELEMETRY_INTERVAL_MS, self._on_imu_telemetry)
-        self.watch("pid.rov_status", self._read_rov_status, ROV_STATUS_INTERVAL_MS, self._on_rov_status)
-
-        self._refresh_enabled()
-
-    # --- UI construction ------------------------------------------------------
-
-    def _build_action_bar(self):
-        layout = QHBoxLayout()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         status_row = QHBoxLayout()
-        self._control_path_label = QLabel("PS4 Controller")
-        status_row.addWidget(self._make_status_card("Active control", self._control_path_label))
+        self.control_path_label = QLabel("PS4 Controller")
+        status_row.addWidget(_make_status_card("Active control", self.control_path_label))
 
-        self._pid_mode_badge = self._make_badge("OFF", "secondary")
-        status_row.addWidget(self._make_status_card("PID", self._pid_mode_badge))
+        self.pid_mode_badge = _make_badge("OFF", "secondary")
+        status_row.addWidget(_make_status_card("PID", self.pid_mode_badge))
 
-        self._branch_label = QLabel("--")
-        status_row.addWidget(self._make_status_card("Branch", self._branch_label))
+        self.branch_label = QLabel("--")
+        status_row.addWidget(_make_status_card("Branch", self.branch_label))
 
-        self._imu_age_label = QLabel("--")
-        status_row.addWidget(self._make_status_card("IMU age (ms)", self._imu_age_label))
+        self.imu_age_label = QLabel("--")
+        status_row.addWidget(_make_status_card("IMU age (ms)", self.imu_age_label))
         layout.addLayout(status_row, 1)
 
         controls = QHBoxLayout()
-        self._btn_toggle_pid = QPushButton("Start PID")
-        self._btn_toggle_pid.clicked.connect(self._toggle_pid)
-        self._btn_force_start = QPushButton("Force Start")
-        self._btn_force_start.setVisible(False)
-        self._btn_force_start.clicked.connect(self._force_start_pid)
-        self._btn_rearm = QPushButton("Re-arm")
-        self._btn_rearm.clicked.connect(self._rearm_controls)
-        self._btn_kill = QPushButton("KILLSWITCH")
-        self._btn_kill.clicked.connect(self._kill_controls)
-        controls.addWidget(self._btn_toggle_pid)
-        controls.addWidget(self._btn_force_start)
-        controls.addWidget(self._btn_rearm)
-        controls.addWidget(self._btn_kill)
+        self.btn_toggle_pid = QPushButton("Start PID")
+        self.btn_force_start = QPushButton("Force Start")
+        self.btn_force_start.setVisible(False)
+        self.btn_rearm = QPushButton("Re-arm")
+        self.btn_kill = QPushButton("KILLSWITCH")
+        controls.addWidget(self.btn_toggle_pid)
+        controls.addWidget(self.btn_force_start)
+        controls.addWidget(self.btn_rearm)
+        controls.addWidget(self.btn_kill)
         layout.addLayout(controls)
-        return layout
 
-    @staticmethod
-    def _make_status_card(title, value_widget):
-        box = QGroupBox()
-        v = QVBoxLayout(box)
-        v.addWidget(QLabel(f"<small>{title}</small>"))
-        v.addWidget(value_widget)
-        return box
+        if screen is not None:
+            self.btn_toggle_pid.clicked.connect(screen._toggle_pid)
+            self.btn_force_start.clicked.connect(screen._force_start_pid)
+            self.btn_rearm.clicked.connect(screen._rearm_controls)
+            self.btn_kill.clicked.connect(screen._kill_controls)
+        else:
+            _disable_for_standalone(self, [self.btn_toggle_pid, self.btn_rearm, self.btn_kill])
 
-    def _make_badge(self, text, variant):
-        label = QLabel()
-        self._badge(label, text, variant)
-        return label
 
-    def _badge(self, label, text, variant="secondary"):
-        bg, fg = _BADGE_COLORS.get(variant, _BADGE_COLORS["secondary"])
-        label.setText(text)
-        label.setStyleSheet(f"background-color:{bg}; color:{fg}; padding:2px 10px; border-radius:4px; font-weight:600;")
+class ReadoutsPanel(PanelBase):
+    """Position/Setpoint/Error readout for roll, pitch, yaw.
 
-    def _build_readouts(self):
-        layout = QHBoxLayout()
-        self._readout_labels = {}
+    Read-only, so it is safe to duplicate or pop out on its own — unlike every other panel on
+    this screen it never writes to the vehicle. Self-sufficient: polls its own data so it works
+    alone in a dock, mirroring `graphs.py`'s `ChartPanel`.
+
+    `local_setpoints` is an optional read-only view into `PidTuningScreen._local_setpoints` (a
+    plain dict, shared by reference) so a setpoint typed but not yet sent still previews here,
+    same as before decomposition. Standalone, it defaults to empty — no pending edits to show.
+    """
+
+    def __init__(self, hub, local_setpoints=None, parent=None):
+        super().__init__(hub, parent)
+        self.title = "PID Axis Readouts"
+        self._local_setpoints = local_setpoints if local_setpoints is not None else {}
+        self._latest_imu = {}
+        self._latest_telemetry = None
+        self._pid_enabled = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.readout_labels = {}
         for axis, label_text in ROT_AXIS_LABELS:
             box = QGroupBox(label_text)
             grid = QGridLayout(box)
@@ -187,89 +376,147 @@ class PidTuningScreen(ScreenBase):
             grid.addWidget(set_label, 1, 1)
             grid.addWidget(QLabel("Error"), 0, 2)
             grid.addWidget(err_label, 1, 2)
-            self._readout_labels[axis] = {"position": pos_label, "setpoint": set_label, "error": err_label}
+            self.readout_labels[axis] = {"position": pos_label, "setpoint": set_label, "error": err_label}
             layout.addWidget(box)
-        return layout
 
-    def _build_left_stack(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.addWidget(self._build_override_panel())
-        layout.addWidget(self._build_setpoints_panel())
-        layout.addStretch(1)
-        return widget
+        self.watch(
+            "pid.control_state", lambda: read_control_state(self.hub), CONTROL_STATE_INTERVAL_MS, self._on_control_state
+        )
+        self.watch(
+            "pid.imu_telemetry", lambda: read_imu_telemetry(self.hub), IMU_TELEMETRY_INTERVAL_MS, self._on_sample
+        )
 
-    def _build_right_stack(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.addWidget(self._build_gains_panel())
-        layout.addWidget(self._build_telemetry_panel(), 1)
-        return widget
+    def _on_control_state(self, state):
+        self._pid_enabled = bool(state and state.get("pid_enabled") is True)
+        self._refresh()
 
-    def _build_override_panel(self):
+    def _on_sample(self, payload):
+        imu_stats = payload.get("imu")
+        if imu_stats:
+            data = imu_stats.get("last_data") or {}
+            self._latest_imu = {axis: _safe_float(data.get(axis)) for axis in logic.ATTITUDE_AXES}
+        self._latest_telemetry = payload.get("telemetry") or None
+        self._refresh()
+
+    def _refresh(self):
+        telemetry = self._latest_telemetry or {}
+        for axis in logic.ATTITUDE_AXES:
+            setpoint = _telemetry_setpoint(telemetry, axis, self._local_setpoints, self._pid_enabled)
+            position = _axis_measurement(telemetry, self._latest_imu, axis)
+            error = _axis_error(telemetry, axis, setpoint, position)
+            labels = self.readout_labels[axis]
+            labels["position"].setText(_fmt(position))
+            labels["setpoint"].setText(_fmt(setpoint))
+            labels["error"].setText(_fmt(error))
+            if error is None:
+                labels["error"].setStyleSheet("color: gray;")
+            elif abs(error) > 25:
+                labels["error"].setStyleSheet("color: #dc3545; font-weight: bold;")
+            elif abs(error) > 10:
+                labels["error"].setStyleSheet("color: #c98a00; font-weight: bold;")
+            else:
+                labels["error"].setStyleSheet("")
+
+
+class OverridePanel(PanelBase):
+    """Debug-override sliders (per-axis manual thruster command) and enable/disable buttons.
+
+    Writes to the vehicle at 20 Hz while active, so it stays single-instance. Delegates to
+    `PidTuningScreen._enable_override` / `_disable_override` / `_reset_all_sliders` when
+    composed; standalone, its controls are disabled (see module docstring).
+    """
+
+    def __init__(self, hub, screen=None, parent=None):
+        super().__init__(hub, parent)
+        self.title = "PID Override Controls"
+
         box = QGroupBox("Override Controls")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
         layout = QVBoxLayout(box)
 
         header = QHBoxLayout()
         header.addStretch(1)
-        self._debug_status_badge = self._make_badge("INACTIVE", "secondary")
-        header.addWidget(self._debug_status_badge)
+        self.debug_status_badge = _make_badge("INACTIVE", "secondary")
+        header.addWidget(self.debug_status_badge)
         layout.addLayout(header)
 
         buttons = QHBoxLayout()
-        self._btn_enable = QPushButton("Enable Override")
-        self._btn_enable.clicked.connect(self._enable_override)
-        self._btn_disable = QPushButton("Disable Override")
-        self._btn_disable.setEnabled(False)
-        self._btn_disable.clicked.connect(self._disable_override)
-        self._btn_reset_all = QPushButton("Reset Sliders")
-        self._btn_reset_all.clicked.connect(self._reset_all_sliders)
-        buttons.addWidget(self._btn_enable)
-        buttons.addWidget(self._btn_disable)
-        buttons.addWidget(self._btn_reset_all)
+        self.btn_enable = QPushButton("Enable Override")
+        self.btn_disable = QPushButton("Disable Override")
+        self.btn_disable.setEnabled(False)
+        self.btn_reset_all = QPushButton("Reset Sliders")
+        buttons.addWidget(self.btn_enable)
+        buttons.addWidget(self.btn_disable)
+        buttons.addWidget(self.btn_reset_all)
         layout.addLayout(buttons)
 
         grid = QGridLayout()
-        self._sliders = {}
+        self.sliders = {}
         for index, (axis, label) in enumerate(AXIS_LABELS):
             widget = AxisSlider(axis, label)
-            self._sliders[axis] = widget
+            self.sliders[axis] = widget
             grid.addWidget(widget, index // 3, index % 3)
         layout.addLayout(grid)
-        return box
 
-    def _build_setpoints_panel(self):
+        if screen is not None:
+            self.btn_enable.clicked.connect(screen._enable_override)
+            self.btn_disable.clicked.connect(screen._disable_override)
+            self.btn_reset_all.clicked.connect(screen._reset_all_sliders)
+        else:
+            for widget in self.sliders.values():
+                widget.setEnabled(False)
+            _disable_for_standalone(self, [self.btn_enable, self.btn_disable, self.btn_reset_all])
+
+
+class SetpointsPanel(PanelBase):
+    """Angle setpoint entry for roll/pitch/yaw, plus save/stop-and-clear.
+
+    Writes to the vehicle (sends or clears PID setpoints), so it stays single-instance.
+    Delegates to `PidTuningScreen` when composed; standalone, its controls are disabled.
+    """
+
+    def __init__(self, hub, screen=None, parent=None):
+        super().__init__(hub, parent)
+        self.title = "PID Angle Setpoints"
+
         box = QGroupBox("Angle Setpoints")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
         layout = QVBoxLayout(box)
 
         header = QHBoxLayout()
         header.addStretch(1)
-        self._setpoint_status_badge = self._make_badge("IDLE", "secondary")
-        header.addWidget(self._setpoint_status_badge)
+        self.setpoint_status_badge = _make_badge("IDLE", "secondary")
+        header.addWidget(self.setpoint_status_badge)
         layout.addLayout(header)
 
         note = QLabel("VN-100 YPR degrees: roll and yaw use -180..+180. Pitch uses -90..+90.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
-        self._setpoint_inputs = {}
-        self._use_current_buttons = {}
-        self._clear_axis_buttons = {}
+        self.setpoint_inputs = {}
+        self.use_current_buttons = {}
+        self.clear_axis_buttons = {}
         form = QGridLayout()
         for row, (axis, label) in enumerate(ROT_AXIS_LABELS):
             limit = logic.ATTITUDE_LIMITS_DEG[axis]
             edit = QLineEdit()
             edit.setPlaceholderText("0.0")
             edit.setValidator(QDoubleValidator(-limit, limit, 2, edit))
-            self._setpoint_inputs[axis] = edit
+            self.setpoint_inputs[axis] = edit
 
             use_btn = QPushButton("Use Current")
-            use_btn.clicked.connect(partial(self._use_current, axis))
-            self._use_current_buttons[axis] = use_btn
+            self.use_current_buttons[axis] = use_btn
 
             clear_btn = QPushButton("Clear")
-            clear_btn.clicked.connect(partial(self._clear_axis, axis))
-            self._clear_axis_buttons[axis] = clear_btn
+            self.clear_axis_buttons[axis] = clear_btn
+
+            if screen is not None:
+                use_btn.clicked.connect(partial(screen._use_current, axis))
+                clear_btn.clicked.connect(partial(screen._clear_axis, axis))
 
             form.addWidget(QLabel(label), row, 0)
             form.addWidget(edit, row, 1)
@@ -278,36 +525,57 @@ class PidTuningScreen(ScreenBase):
         layout.addLayout(form)
 
         buttons = QHBoxLayout()
-        self._btn_send_setpoints = QPushButton("Save Setpoints")
-        self._btn_send_setpoints.clicked.connect(self._send_setpoints)
-        self._btn_clear_setpoints = QPushButton("Stop and Clear")
-        self._btn_clear_setpoints.clicked.connect(self._clear_setpoints)
-        buttons.addWidget(self._btn_send_setpoints)
-        buttons.addWidget(self._btn_clear_setpoints)
+        self.btn_send_setpoints = QPushButton("Save Setpoints")
+        self.btn_clear_setpoints = QPushButton("Stop and Clear")
+        buttons.addWidget(self.btn_send_setpoints)
+        buttons.addWidget(self.btn_clear_setpoints)
         layout.addLayout(buttons)
 
-        self._setpoint_feedback = QLabel("Waiting for input.")
-        self._setpoint_feedback.setWordWrap(True)
-        layout.addWidget(self._setpoint_feedback)
-        return box
+        self.setpoint_feedback = QLabel("Waiting for input.")
+        self.setpoint_feedback.setWordWrap(True)
+        layout.addWidget(self.setpoint_feedback)
 
-    def _build_gains_panel(self):
+        if screen is not None:
+            self.btn_send_setpoints.clicked.connect(screen._send_setpoints)
+            self.btn_clear_setpoints.clicked.connect(screen._clear_setpoints)
+        else:
+            widgets = (
+                [self.btn_send_setpoints, self.btn_clear_setpoints]
+                + list(self.use_current_buttons.values())
+                + list(self.clear_axis_buttons.values())
+            )
+            _disable_for_standalone(self, widgets)
+
+
+class GainsPanel(PanelBase):
+    """MCU PID gain request/send, plus saved-tune presets (local JSON, not networked).
+
+    Writes to the vehicle (sends PID gains) and to local config storage, so it stays
+    single-instance. Delegates to `PidTuningScreen` when composed; standalone, its controls
+    are disabled.
+    """
+
+    def __init__(self, hub, screen=None, parent=None):
+        super().__init__(hub, parent)
+        self.title = "PID Values"
+
         box = QGroupBox("PID Values")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
         layout = QVBoxLayout(box)
 
         header = QHBoxLayout()
         header.addStretch(1)
-        self._gain_sync_badge = self._make_badge("READY", "secondary")
-        header.addWidget(self._gain_sync_badge)
+        self.gain_sync_badge = _make_badge("READY", "secondary")
+        header.addWidget(self.gain_sync_badge)
         layout.addLayout(header)
 
         buttons = QHBoxLayout()
-        self._btn_pid_request = QPushButton("Request Current")
-        self._btn_pid_request.clicked.connect(self._request_pid_gains)
-        self._btn_pid_send = QPushButton("Send to MCU")
-        self._btn_pid_send.clicked.connect(self._send_pid_gains)
-        buttons.addWidget(self._btn_pid_request)
-        buttons.addWidget(self._btn_pid_send)
+        self.btn_pid_request = QPushButton("Request Current")
+        self.btn_pid_send = QPushButton("Send to MCU")
+        buttons.addWidget(self.btn_pid_request)
+        buttons.addWidget(self.btn_pid_send)
         layout.addLayout(buttons)
 
         grid = QGridLayout()
@@ -315,7 +583,7 @@ class PidTuningScreen(ScreenBase):
         grid.addWidget(QLabel("P"), 0, 1)
         grid.addWidget(QLabel("I"), 0, 2)
         grid.addWidget(QLabel("D"), 0, 3)
-        self._gain_inputs = {}
+        self.gain_inputs = {}
         for row, (axis, label) in enumerate(ROT_AXIS_LABELS, start=1):
             grid.addWidget(QLabel(label), row, 0)
             axis_inputs = {}
@@ -326,57 +594,258 @@ class PidTuningScreen(ScreenBase):
                 spin.setSingleStep(0.01)
                 grid.addWidget(spin, row, col)
                 axis_inputs[gain] = spin
-            self._gain_inputs[axis] = axis_inputs
+            self.gain_inputs[axis] = axis_inputs
         layout.addLayout(grid)
 
         config_row = QHBoxLayout()
-        self._pid_config_name = QLineEdit()
-        self._pid_config_name.setPlaceholderText("Tune name")
-        self._btn_pid_save = QPushButton("Save")
-        self._btn_pid_save.clicked.connect(self._save_config)
-        self._pid_config_select = QComboBox()
-        self._pid_config_select.addItem("Load tune", "")
-        self._btn_pid_load = QPushButton("Load")
-        self._btn_pid_load.clicked.connect(self._load_config)
-        self._btn_pid_delete = QPushButton("Delete")
-        self._btn_pid_delete.clicked.connect(self._delete_config)
-        self._delete_armed = False
-        self._delete_arm_timer = QTimer(self)
-        self._delete_arm_timer.setSingleShot(True)
-        self._delete_arm_timer.timeout.connect(self._disarm_delete)
-        self._config_status_badge = self._make_badge("-", "secondary")
-        config_row.addWidget(self._pid_config_name)
-        config_row.addWidget(self._btn_pid_save)
-        config_row.addWidget(self._pid_config_select)
-        config_row.addWidget(self._btn_pid_load)
-        config_row.addWidget(self._btn_pid_delete)
-        config_row.addWidget(self._config_status_badge)
+        self.pid_config_name = QLineEdit()
+        self.pid_config_name.setPlaceholderText("Tune name")
+        self.btn_pid_save = QPushButton("Save")
+        self.pid_config_select = QComboBox()
+        self.pid_config_select.addItem("Load tune", "")
+        self.btn_pid_load = QPushButton("Load")
+        self.btn_pid_delete = QPushButton("Delete")
+        self.config_status_badge = _make_badge("-", "secondary")
+        config_row.addWidget(self.pid_config_name)
+        config_row.addWidget(self.btn_pid_save)
+        config_row.addWidget(self.pid_config_select)
+        config_row.addWidget(self.btn_pid_load)
+        config_row.addWidget(self.btn_pid_delete)
+        config_row.addWidget(self.config_status_badge)
         layout.addLayout(config_row)
-        return box
 
-    def _build_telemetry_panel(self):
+        if screen is not None:
+            self.btn_pid_request.clicked.connect(screen._request_pid_gains)
+            self.btn_pid_send.clicked.connect(screen._send_pid_gains)
+            self.btn_pid_save.clicked.connect(screen._save_config)
+            self.btn_pid_load.clicked.connect(screen._load_config)
+            self.btn_pid_delete.clicked.connect(screen._delete_config)
+        else:
+            _disable_for_standalone(
+                self,
+                [self.btn_pid_request, self.btn_pid_send, self.btn_pid_save, self.btn_pid_load, self.btn_pid_delete],
+            )
+
+
+class TelemetryPanel(PanelBase):
+    """Per-axis PID telemetry table plus the raw debug JSON view (rov status / uplink / link).
+
+    Read-only, so it is safe to duplicate or pop out on its own. Self-sufficient: polls its own
+    data (control state, IMU + control telemetry, rov status) so it works alone in a dock.
+
+    `local_setpoints` is the same optional shared-dict view used by `ReadoutsPanel` — see there.
+    """
+
+    def __init__(self, hub, local_setpoints=None, parent=None):
+        super().__init__(hub, parent)
+        self.title = "PID Telemetry and Link"
+        self._local_setpoints = local_setpoints if local_setpoints is not None else {}
+        self._latest_imu = {}
+        self._latest_telemetry = None
+        self._latest_control_state = {}
+        self._pid_enabled = False
+
         box = QGroupBox("Telemetry and Link")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
         layout = QVBoxLayout(box)
 
         header = QHBoxLayout()
         header.addStretch(1)
-        self._telemetry_age_badge = self._make_badge("NO TELEMETRY", "secondary")
-        header.addWidget(self._telemetry_age_badge)
+        self.telemetry_age_badge = _make_badge("NO TELEMETRY", "secondary")
+        header.addWidget(self.telemetry_age_badge)
         layout.addLayout(header)
 
-        self._telemetry_table = QTableWidget(len(ROT_AXIS_LABELS), 7)
-        self._telemetry_table.setHorizontalHeaderLabels(
+        self.telemetry_table = QTableWidget(len(ROT_AXIS_LABELS), 7)
+        self.telemetry_table.setHorizontalHeaderLabels(
             ["Axis", "Mode", "Setpoint", "MCU Measure", "Error", "Output", "Gains"]
         )
-        self._telemetry_table.verticalHeader().setVisible(False)
-        self._telemetry_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self._telemetry_table)
+        self.telemetry_table.verticalHeader().setVisible(False)
+        self.telemetry_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.telemetry_table)
 
-        self._rov_status_view = QPlainTextEdit()
-        self._rov_status_view.setReadOnly(True)
-        self._rov_status_view.setPlainText("Loading...")
-        layout.addWidget(self._rov_status_view, 1)
-        return box
+        self.rov_status_view = QPlainTextEdit()
+        self.rov_status_view.setReadOnly(True)
+        self.rov_status_view.setPlainText("Loading...")
+        layout.addWidget(self.rov_status_view, 1)
+
+        self.watch(
+            "pid.control_state", lambda: read_control_state(self.hub), CONTROL_STATE_INTERVAL_MS, self._on_control_state
+        )
+        self.watch(
+            "pid.imu_telemetry",
+            lambda: read_imu_telemetry(self.hub),
+            IMU_TELEMETRY_INTERVAL_MS,
+            self._on_imu_telemetry,
+        )
+        self.watch("pid.rov_status", lambda: read_rov_status(self.hub), ROV_STATUS_INTERVAL_MS, self._on_rov_status)
+
+    def _on_control_state(self, state):
+        self._latest_control_state = state or {}
+        self._pid_enabled = self._latest_control_state.get("pid_enabled") is True
+        self._update_table()
+
+    def _on_imu_telemetry(self, payload):
+        imu_stats = payload.get("imu")
+        if imu_stats:
+            data = imu_stats.get("last_data") or {}
+            self._latest_imu = {axis: _safe_float(data.get(axis)) for axis in logic.ATTITUDE_AXES}
+        self._latest_telemetry = payload.get("telemetry") or None
+        self._update_telemetry_age()
+        self._update_table()
+
+    def _on_rov_status(self, status):
+        control_state = status.get("control_state") or self._latest_control_state
+        payload = _debug_payload(status, control_state, self._latest_telemetry)
+        self.rov_status_view.setPlainText(json.dumps(payload, indent=2, default=str))
+
+    def _update_telemetry_age(self):
+        telemetry = self._latest_telemetry
+        if not telemetry or telemetry.get("timestamp") is None:
+            _set_badge(self.telemetry_age_badge, "NO TELEMETRY", "secondary")
+            return
+        age_ms = max(0.0, (time.time() - telemetry["timestamp"]) * 1000.0)
+        flags = telemetry.get("flags") or {}
+        if flags.get("timeout"):
+            _set_badge(self.telemetry_age_badge, "NUCLEO TIMEOUT", "danger")
+        elif age_ms < 750:
+            _set_badge(self.telemetry_age_badge, f"{age_ms:.0f} ms", "success")
+        elif age_ms < 2500:
+            _set_badge(self.telemetry_age_badge, f"{age_ms:.0f} ms", "warning")
+        else:
+            _set_badge(self.telemetry_age_badge, "STALE", "danger")
+
+    def _update_table(self):
+        table = self.telemetry_table
+        telemetry = self._latest_telemetry or {}
+        timeout = bool(telemetry and (telemetry.get("flags") or {}).get("timeout"))
+        for row, axis in enumerate(logic.ATTITUDE_AXES):
+            setpoint = _telemetry_setpoint(telemetry, axis, self._local_setpoints, self._pid_enabled)
+            position = _axis_measurement(telemetry, self._latest_imu, axis)
+            error = _axis_error(telemetry, axis, setpoint, position)
+            output = _axis_output(telemetry, axis)
+            values = [
+                axis.upper(),
+                _axis_mode(telemetry, axis),
+                _fmt(setpoint),
+                _fmt(position),
+                _fmt(error),
+                _fmt(output),
+                _axis_gains_text(telemetry, axis),
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if timeout:
+                    item.setBackground(QColor("#3a1414"))
+                elif col == 4 and error is not None and abs(error) > 25:
+                    item.setForeground(QColor("#dc3545"))
+                elif col == 4 and error is not None and abs(error) > 10:
+                    item.setForeground(QColor("#c98a00"))
+                table.setItem(row, col, item)
+
+
+class PidTuningScreen(ScreenBase):
+    title = "PID Tuning"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+
+        self._override_active = False
+        self._local_setpoints = {axis: None for axis in logic.ATTITUDE_AXES}
+        self._latest_imu = {}
+        self._latest_control_state = {}
+
+        root = QVBoxLayout(self)
+        root.addWidget(self.notice_widget)
+
+        self._action_bar_panel = ActionBarPanel(hub, screen=self)
+        self._control_path_label = self._action_bar_panel.control_path_label
+        self._pid_mode_badge = self._action_bar_panel.pid_mode_badge
+        self._branch_label = self._action_bar_panel.branch_label
+        self._imu_age_label = self._action_bar_panel.imu_age_label
+        self._btn_toggle_pid = self._action_bar_panel.btn_toggle_pid
+        self._btn_force_start = self._action_bar_panel.btn_force_start
+        self._btn_rearm = self._action_bar_panel.btn_rearm
+        self._btn_kill = self._action_bar_panel.btn_kill
+        root.addWidget(self._action_bar_panel)
+
+        self._readouts_panel = ReadoutsPanel(hub, local_setpoints=self._local_setpoints)
+        root.addWidget(self._readouts_panel)
+
+        self._override_panel = OverridePanel(hub, screen=self)
+        self._debug_status_badge = self._override_panel.debug_status_badge
+        self._btn_enable = self._override_panel.btn_enable
+        self._btn_disable = self._override_panel.btn_disable
+        self._btn_reset_all = self._override_panel.btn_reset_all
+        self._sliders = self._override_panel.sliders
+
+        self._setpoints_panel = SetpointsPanel(hub, screen=self)
+        self._setpoint_status_badge = self._setpoints_panel.setpoint_status_badge
+        self._setpoint_inputs = self._setpoints_panel.setpoint_inputs
+        self._use_current_buttons = self._setpoints_panel.use_current_buttons
+        self._clear_axis_buttons = self._setpoints_panel.clear_axis_buttons
+        self._btn_send_setpoints = self._setpoints_panel.btn_send_setpoints
+        self._btn_clear_setpoints = self._setpoints_panel.btn_clear_setpoints
+        self._setpoint_feedback = self._setpoints_panel.setpoint_feedback
+
+        self._gains_panel = GainsPanel(hub, screen=self)
+        self._gain_sync_badge = self._gains_panel.gain_sync_badge
+        self._btn_pid_request = self._gains_panel.btn_pid_request
+        self._btn_pid_send = self._gains_panel.btn_pid_send
+        self._gain_inputs = self._gains_panel.gain_inputs
+        self._pid_config_name = self._gains_panel.pid_config_name
+        self._btn_pid_save = self._gains_panel.btn_pid_save
+        self._pid_config_select = self._gains_panel.pid_config_select
+        self._btn_pid_load = self._gains_panel.btn_pid_load
+        self._btn_pid_delete = self._gains_panel.btn_pid_delete
+        self._config_status_badge = self._gains_panel.config_status_badge
+
+        self._telemetry_panel = TelemetryPanel(hub, local_setpoints=self._local_setpoints)
+
+        columns = QHBoxLayout()
+        columns.addWidget(self._build_left_stack(), 1)
+        columns.addWidget(self._build_right_stack(), 1)
+        root.addLayout(columns, 1)
+
+        # A plain QTimer, not a hub poller: this is a local write loop (matches debug.py).
+        self._send_timer = QTimer(self)
+        self._send_timer.setInterval(SEND_INTERVAL_MS)
+        self._send_timer.timeout.connect(self._send_override)
+
+        # Two-step arm for "Delete" (see module docstring) -- lives on the screen, not
+        # GainsPanel, since a standalone GainsPanel disables the button entirely.
+        self._delete_armed = False
+        self._delete_arm_timer = QTimer(self)
+        self._delete_arm_timer.setSingleShot(True)
+        self._delete_arm_timer.timeout.connect(self._disarm_delete)
+
+        self.watch(
+            "pid.control_state", self._read_control_state, CONTROL_STATE_INTERVAL_MS, self._on_control_state_update
+        )
+        self.watch("pid.imu_telemetry", self._read_imu_telemetry, IMU_TELEMETRY_INTERVAL_MS, self._on_imu_telemetry)
+
+        self._refresh_enabled()
+
+    # --- layout composition -----------------------------------------------------
+
+    def _build_left_stack(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(self._override_panel)
+        layout.addWidget(self._setpoints_panel)
+        layout.addStretch(1)
+        return widget
+
+    def _build_right_stack(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(self._gains_panel)
+        layout.addWidget(self._telemetry_panel, 1)
+        return widget
+
+    def _badge(self, label, text, variant="secondary"):
+        _set_badge(label, text, variant)
 
     # --- lifecycle --------------------------------------------------------
 
@@ -396,8 +865,7 @@ class PidTuningScreen(ScreenBase):
     # --- polling: control state --------------------------------------------
 
     def _read_control_state(self):
-        ctrl = self.hub.controller
-        return ctrl.get_control_state() if ctrl else None
+        return read_control_state(self.hub)
 
     def _on_control_state_update(self, state):
         if state is None:
@@ -409,84 +877,19 @@ class PidTuningScreen(ScreenBase):
     # --- polling: IMU + control telemetry -----------------------------------
 
     def _read_imu_telemetry(self):
-        hub = self.hub
-        imu_stats = hub.imu.get_stats() if hub.imu else None
-        telemetry = hub.control_telem.get_latest() if hub.control_telem else None
-        return {"imu": imu_stats, "telemetry": telemetry}
+        return read_imu_telemetry(self.hub)
 
     def _on_imu_telemetry(self, payload):
         imu_stats = payload.get("imu")
         if imu_stats:
             data = imu_stats.get("last_data") or {}
-            self._latest_imu = {axis: self._safe_float(data.get(axis)) for axis in logic.ATTITUDE_AXES}
+            self._latest_imu = {axis: _safe_float(data.get(axis)) for axis in logic.ATTITUDE_AXES}
             age = imu_stats.get("age_ms")
             self._imu_age_label.setText(str(age) if age is not None else "--")
         else:
             self._imu_age_label.setText("--")
-        self._latest_telemetry = payload.get("telemetry") or None
-        self._update_telemetry_age(self._latest_telemetry)
-        self._update_telemetry_table()
-
-    # --- polling: rov status / debug view ------------------------------------
-
-    def _read_rov_status(self):
-        hub = self.hub
-        udp_rx, udp_err = hub.resource.get_udp_counters() if hub.resource else (0, 0)
-        ctrl = hub.controller
-        return {
-            "command": hub.bitmask.get_command() if hub.bitmask else {},
-            "uplink": hub.bitmask.get_uplink_status() if hub.bitmask else {},
-            "control_state": ctrl.get_control_state() if ctrl else {},
-            "resource": {"udp_rx_count": udp_rx, "udp_rx_errors": udp_err},
-        }
-
-    def _on_rov_status(self, status):
-        control_state = status.get("control_state")
-        if control_state:
-            self._update_control_banner(control_state)
-        payload = self._build_debug_payload(status, control_state or self._latest_control_state)
-        self._rov_status_view.setPlainText(json.dumps(payload, indent=2, default=str))
-
-    def _build_debug_payload(self, status, control):
-        control = control or {}
-        uplink = status.get("uplink") or {}
-        telemetry = self._latest_telemetry or {}
-        return {
-            "control_path": self._control_path_text(control.get("control_path"), control.get("killed") is True),
-            "pid_enabled": control.get("pid_enabled"),
-            "active_setpoints": control.get("pid_setpoints"),
-            "manual_command_before_pid": control.get("manual_command_before_pid"),
-            "mcu_flags": telemetry.get("flags", {}),
-            "mcu_command_age_ms": telemetry.get("last_command_age_ms"),
-            "mcu_measurement": telemetry.get("measurement", {}),
-            "pid_output": telemetry.get("output", {}),
-            "pid_gains_mcu": telemetry.get("gains", {}),
-            "final_topside_command": status.get("command"),
-            "raw_payload": uplink.get("last_packet_hex"),
-            "timestamp": uplink.get("last_send_timestamp"),
-            "sequence": uplink.get("sequence"),
-            "link": {
-                "ack_age_ms": uplink.get("last_ack_age_ms"),
-                "watchdog_resends": uplink.get("watchdog_resends"),
-            },
-            "telemetry": {
-                "sequence": telemetry.get("sequence"),
-                "timestamp": telemetry.get("timestamp"),
-            },
-            "resource": status.get("resource"),
-        }
 
     # --- control banner / readouts ------------------------------------------
-
-    @staticmethod
-    def _control_path_text(path, killed):
-        if killed:
-            return "Controls locked"
-        if path == "Override Controls":
-            return "Override sliders"
-        if path == "PS4":
-            return "PS4 Controller"
-        return path or "PS4 Controller"
 
     def _update_control_banner(self, state):
         self._latest_control_state = state or {}
@@ -494,10 +897,10 @@ class PidTuningScreen(ScreenBase):
         pid_on = self._latest_control_state.get("pid_enabled") is True
         path = self._latest_control_state.get("control_path") or "PS4"
         setpoints = self._latest_control_state.get("pid_setpoints") or {}
-        has_setpoints = any(self._safe_float(setpoints.get(axis)) is not None for axis in logic.ATTITUDE_AXES)
+        has_setpoints = any(_safe_float(setpoints.get(axis)) is not None for axis in logic.ATTITUDE_AXES)
         self._sync_local_setpoints(setpoints, clear_missing=False)
 
-        self._control_path_label.setText(self._control_path_text(path, killed))
+        self._control_path_label.setText(_control_path_text(path, killed))
         self._badge(self._pid_mode_badge, "ON" if pid_on else "OFF", "success" if pid_on else "secondary")
         if pid_on:
             self._badge(self._setpoint_status_badge, "ACTIVE", "danger")
@@ -506,7 +909,6 @@ class PidTuningScreen(ScreenBase):
         else:
             self._badge(self._setpoint_status_badge, "IDLE", "secondary")
         self._btn_toggle_pid.setText("Stop PID" if pid_on else "Start PID")
-        self._update_axis_readouts()
         override_active = self._latest_control_state.get("override_active") is True
         self._badge(
             self._debug_status_badge,
@@ -540,135 +942,6 @@ class PidTuningScreen(ScreenBase):
             btn.setEnabled(enabled)
         self._btn_kill.setEnabled(enabled)
         self._btn_rearm.setEnabled(available and killed)
-
-    # --- axis readouts / telemetry table -------------------------------------
-
-    @staticmethod
-    def _safe_float(value):
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
-
-    @classmethod
-    def _fmt(cls, value, digits=2):
-        value = cls._safe_float(value)
-        return "--" if value is None else f"{value:.{digits}f}"
-
-    def _telemetry_setpoint(self, axis):
-        telemetry = self._latest_telemetry or {}
-        from_telem = self._safe_float((telemetry.get("setpoint") or {}).get(axis))
-        from_local = self._local_setpoints.get(axis)
-        if self._latest_control_state.get("pid_enabled") is True and from_telem is not None:
-            return from_telem
-        if from_local is not None:
-            return from_local
-        return from_telem
-
-    def _axis_measurement(self, axis):
-        telemetry = self._latest_telemetry or {}
-        from_telem = self._safe_float((telemetry.get("measurement") or {}).get(axis))
-        if from_telem is not None:
-            return from_telem
-        return self._safe_float(self._latest_imu.get(axis))
-
-    def _axis_error(self, axis, setpoint, position):
-        telemetry = self._latest_telemetry or {}
-        from_telem = self._safe_float((telemetry.get("error") or {}).get(axis))
-        if from_telem is not None:
-            return from_telem
-        if setpoint is None or position is None:
-            return None
-        if axis == "pitch":
-            return setpoint - position
-        return logic.normalize_angle_deg(setpoint - position)
-
-    def _axis_output(self, axis):
-        telemetry = self._latest_telemetry or {}
-        return self._safe_float((telemetry.get("output") or {}).get(axis))
-
-    def _axis_gains_text(self, axis):
-        telemetry = self._latest_telemetry or {}
-        gains = (telemetry.get("gains") or {}).get(axis)
-        if not gains:
-            return "--"
-        return f"P {self._fmt(gains.get('kp'))} I {self._fmt(gains.get('ki'))} D {self._fmt(gains.get('kd'))}"
-
-    def _axis_mode(self, axis):
-        telemetry = self._latest_telemetry
-        if not telemetry:
-            return "--"
-        flags = telemetry.get("flags") or {}
-        if flags.get("timeout"):
-            return "TIMEOUT"
-        bit = 1 << logic.CONTROL_AXES.index(axis)
-        if (telemetry.get("override_mask") or 0) & bit:
-            return "OVR"
-        if (telemetry.get("pid_active_mask") or 0) & bit:
-            return "PID"
-        return "LEGACY" if telemetry.get("protocol_version") == 1 else "PASS"
-
-    def _update_axis_readouts(self):
-        for axis in logic.ATTITUDE_AXES:
-            setpoint = self._telemetry_setpoint(axis)
-            position = self._axis_measurement(axis)
-            error = self._axis_error(axis, setpoint, position)
-            labels = self._readout_labels[axis]
-            labels["position"].setText(self._fmt(position))
-            labels["setpoint"].setText(self._fmt(setpoint))
-            labels["error"].setText(self._fmt(error))
-            if error is None:
-                labels["error"].setStyleSheet("color: gray;")
-            elif abs(error) > 25:
-                labels["error"].setStyleSheet("color: #dc3545; font-weight: bold;")
-            elif abs(error) > 10:
-                labels["error"].setStyleSheet("color: #c98a00; font-weight: bold;")
-            else:
-                labels["error"].setStyleSheet("")
-
-    def _update_telemetry_table(self):
-        self._update_axis_readouts()
-        table = self._telemetry_table
-        timeout = bool(self._latest_telemetry and (self._latest_telemetry.get("flags") or {}).get("timeout"))
-        for row, axis in enumerate(logic.ATTITUDE_AXES):
-            setpoint = self._telemetry_setpoint(axis)
-            position = self._axis_measurement(axis)
-            error = self._axis_error(axis, setpoint, position)
-            output = self._axis_output(axis)
-            values = [
-                axis.upper(),
-                self._axis_mode(axis),
-                self._fmt(setpoint),
-                self._fmt(position),
-                self._fmt(error),
-                self._fmt(output),
-                self._axis_gains_text(axis),
-            ]
-            for col, text in enumerate(values):
-                item = QTableWidgetItem(text)
-                if timeout:
-                    item.setBackground(QColor("#3a1414"))
-                elif col == 4 and error is not None and abs(error) > 25:
-                    item.setForeground(QColor("#dc3545"))
-                elif col == 4 and error is not None and abs(error) > 10:
-                    item.setForeground(QColor("#c98a00"))
-                table.setItem(row, col, item)
-
-    def _update_telemetry_age(self, telemetry):
-        if not telemetry or telemetry.get("timestamp") is None:
-            self._badge(self._telemetry_age_badge, "NO TELEMETRY", "secondary")
-            return
-        age_ms = max(0.0, (time.time() - telemetry["timestamp"]) * 1000.0)
-        flags = telemetry.get("flags") or {}
-        if flags.get("timeout"):
-            self._badge(self._telemetry_age_badge, "NUCLEO TIMEOUT", "danger")
-        elif age_ms < 750:
-            self._badge(self._telemetry_age_badge, f"{age_ms:.0f} ms", "success")
-        elif age_ms < 2500:
-            self._badge(self._telemetry_age_badge, f"{age_ms:.0f} ms", "warning")
-        else:
-            self._badge(self._telemetry_age_badge, "STALE", "danger")
 
     # --- feedback -------------------------------------------------------------
 
@@ -739,7 +1012,7 @@ class PidTuningScreen(ScreenBase):
     def _sync_local_setpoints(self, setpoints, clear_missing=True):
         setpoints = setpoints or {}
         for axis in logic.ATTITUDE_AXES:
-            value = self._safe_float(setpoints.get(axis)) if axis in setpoints else None
+            value = _safe_float(setpoints.get(axis)) if axis in setpoints else None
             edit = self._setpoint_inputs[axis]
             if value is not None:
                 self._local_setpoints[axis] = value
@@ -751,7 +1024,7 @@ class PidTuningScreen(ScreenBase):
                     edit.clear()
 
     def _use_current(self, axis):
-        value = self._safe_float(self._latest_imu.get(axis))
+        value = _safe_float(self._latest_imu.get(axis))
         if value is None:
             return
         clamped = logic.coerce_attitude_setpoints({axis: value}).get(axis)
@@ -1210,3 +1483,59 @@ class PidTuningScreen(ScreenBase):
         logic.save_pid_configs(configs)
         self._badge(self._config_status_badge, "Deleted", "success")
         self._refresh_config_list()
+
+
+#: The two read-only panels are safe to duplicate (nothing here writes to the vehicle); the four
+#: write panels stay single-instance -- see each panel's docstring and the module docstring for
+#: why. Opened standalone (outside this screen) a write panel's controls are disabled rather than
+#: re-running hardware-writing logic through a second code path.
+COMPONENTS = [
+    Component(
+        id="panel.pid_tuning.action_bar",
+        title="PID Action Bar",
+        factory=lambda hub: ActionBarPanel(hub),
+        category="PID",
+        duplicable=False,
+        order=0,
+    ),
+    Component(
+        id="panel.pid_tuning.readouts",
+        title="PID Axis Readouts",
+        factory=lambda hub: ReadoutsPanel(hub),
+        category="PID",
+        duplicable=True,
+        order=1,
+    ),
+    Component(
+        id="panel.pid_tuning.override",
+        title="PID Override Controls",
+        factory=lambda hub: OverridePanel(hub),
+        category="PID",
+        duplicable=False,
+        order=2,
+    ),
+    Component(
+        id="panel.pid_tuning.setpoints",
+        title="PID Angle Setpoints",
+        factory=lambda hub: SetpointsPanel(hub),
+        category="PID",
+        duplicable=False,
+        order=3,
+    ),
+    Component(
+        id="panel.pid_tuning.gains",
+        title="PID Values",
+        factory=lambda hub: GainsPanel(hub),
+        category="PID",
+        duplicable=False,
+        order=4,
+    ),
+    Component(
+        id="panel.pid_tuning.telemetry",
+        title="PID Telemetry and Link",
+        factory=lambda hub: TelemetryPanel(hub),
+        category="PID",
+        duplicable=True,
+        order=5,
+    ),
+]

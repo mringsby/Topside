@@ -1,7 +1,10 @@
 """Connection screen — ports `/connection` (`connection.html` + `connection.js`).
 
 Renders the three-proof Nucleo contact check (`hub.connection_proof()`, thresholds 2500/2500/
-1200 ms, already implemented verbatim in ServiceHub) and the MCU restart control.
+1200 ms, already implemented verbatim in ServiceHub), MCU resource telemetry, the MCU restart
+control, and the dead `test.py` activation placeholder. Each is its own `PanelBase` (see the
+class list below) so it can be docked independently; `ConnectionScreen` just composes them,
+mirroring the split in `desktop/screens/graphs.py`.
 
 `connection.js` gates the restart button behind `window.confirm("Restart the MCU now?")`. That
 gate is kept — restarting the MCU mid-dive is destructive and must not be one stray click away.
@@ -26,7 +29,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from desktop.screens.base import ScreenBase
+from desktop import theme
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 from desktop.widgets.sparkline import SparklineWidget
 
 POLL_INTERVAL_MS = 1000
@@ -34,36 +39,22 @@ RESET_STATUS_RESET_MS = 3000
 #: How long the restart button stays armed awaiting a second click.
 ARM_TIMEOUT_MS = 5000
 
-_BADGE_STYLES = {
-    "secondary": "color: palette(text);",
-    "success": "color: #3fb950; font-weight: 600;",
-    "warning": "color: #d29922; font-weight: 600;",
-    "danger": "color: #f85149; font-weight: 600;",
-}
+_BADGE_STYLES = theme.BADGE
 
 
-class ConnectionScreen(ScreenBase):
-    title = "Connection"
+class NucleoContactProofPanel(PanelBase):
+    """Read-only three-proof Nucleo contact check. Safe to duplicate: nothing here writes."""
+
+    title = "Nucleo Contact Proof"
 
     def __init__(self, hub, parent=None):
         super().__init__(hub, parent)
-
         layout = QVBoxLayout(self)
-        layout.addWidget(self.notice_widget)
-        layout.addWidget(self._build_proof_box())
-        layout.addWidget(self._build_resource_box())
-
-        row = QHBoxLayout()
-        row.addWidget(self._build_reset_box())
-        row.addWidget(self._build_testpy_box())
-        layout.addLayout(row)
-        layout.addStretch(1)
-
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_box())
         self.watch("connection.proof", self.hub.connection_proof, POLL_INTERVAL_MS, self._on_proof)
 
-    # --- Nucleo contact proof -------------------------------------------------
-
-    def _build_proof_box(self):
+    def _build_box(self):
         box = QGroupBox("Nucleo Contact Proof")
         self._contact_badge = QLabel("WAITING")
         self._contact_badge.setStyleSheet(_BADGE_STYLES["secondary"])
@@ -117,8 +108,6 @@ class ConnectionScreen(ScreenBase):
         imu_age = imu.get("age_ms")
         self._imu_age.setText("--" if imu_age is None else f"{round(imu_age)} ms")
 
-        self._render_resources(status.get("resource"))
-
         self._details.setPlainText(
             json.dumps({"uplink": uplink, "resource": status.get("resource"), "imu": imu}, indent=2)
         )
@@ -154,16 +143,27 @@ class ConnectionScreen(ScreenBase):
             table.setItem(row, 2, QTableWidgetItem("--" if age is None else f"{round(age)} ms"))
             table.setItem(row, 3, QTableWidgetItem(str(proof.get("detail") or "")))
 
-    # --- MCU resource telemetry --------------------------------------------------
 
-    def _build_resource_box(self):
-        """`hub.resource.get_stats()` (UDP 12346, ~1 Hz) fed through the same "connection.proof"
-        poll that already carries it in `status["resource"]` -- no second timer.
+class McuResourceTelemetryPanel(PanelBase):
+    """`hub.resource.get_stats()` (UDP 12346, ~1 Hz) fed through the same "connection.proof" poll
+    that already carries it in `status["resource"]` -- no second timer. Read-only: safe to
+    duplicate.
 
-        `udp_rx_errors` is not just a diagnostic: `SetpointOverrideClient._check_resource_health()`
-        (lib/setpoint_override.py) already refuses to send an override once this counter rises,
-        silently. Surfacing its trend here is what makes that failure visible instead of hidden.
-        """
+    `udp_rx_errors` is not just a diagnostic: `SetpointOverrideClient._check_resource_health()`
+    (lib/setpoint_override.py) already refuses to send an override once this counter rises,
+    silently. Surfacing its trend here is what makes that failure visible instead of hidden.
+    """
+
+    title = "MCU Resource Telemetry"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_box())
+        self.watch("connection.proof", self.hub.connection_proof, POLL_INTERVAL_MS, self._on_proof)
+
+    def _build_box(self):
         box = QGroupBox("MCU Resource Telemetry")
         self._resource_box = box
         self._resource_badge = QLabel("--")
@@ -210,6 +210,9 @@ class ConnectionScreen(ScreenBase):
         self._last_crc_errors = None
         self._render_resources(None)
         return box
+
+    def _on_proof(self, status):
+        self._render_resources(status.get("resource"))
 
     def _render_resources(self, resource):
         if self.hub.resource is None:
@@ -290,9 +293,22 @@ class ConnectionScreen(ScreenBase):
             self._last_rx_errors = rx_errors
         self._last_crc_errors = crc_errors
 
-    # --- Restart MCU ------------------------------------------------------------
 
-    def _build_reset_box(self):
+class RestartMcuPanel(PanelBase):
+    """MCU restart, gated by a non-blocking two-step arm instead of a modal confirm(). Writes to
+    the vehicle, so it must stay single-instance."""
+
+    title = "Restart MCU"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._build_box())
+        layout.addStretch(1)
+
+    def _build_box(self):
         box = QGroupBox("Restart MCU")
         self._reset_badge = QLabel("READY")
         self._reset_badge.setStyleSheet(_BADGE_STYLES["secondary"])
@@ -308,7 +324,6 @@ class ConnectionScreen(ScreenBase):
         outer = QVBoxLayout(box)
         outer.addLayout(header)
         outer.addWidget(self._btn_reset)
-        outer.addStretch(1)
 
         self._reset_reenable_timer = QTimer(self)
         self._reset_reenable_timer.setSingleShot(True)
@@ -366,12 +381,23 @@ class ConnectionScreen(ScreenBase):
         self._btn_reset.setEnabled(True)
 
     def on_deactivate(self):
-        """Never leave the restart armed for whoever opens this tab next."""
+        """Never leave the restart armed for whoever opens this tab/dock next."""
         self._disarm()
 
-    # --- test.py activation (dead placeholder, ported as-is) -----------------------
 
-    def _build_testpy_box(self):
+class TestPyActivationPanel(PanelBase):
+    """Dead placeholder, ported as-is."""
+
+    title = "test.py Activation"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_box())
+        layout.addStretch(1)
+
+    def _build_box(self):
         box = QGroupBox("test.py Activation")
         btn = QPushButton("TODO")
         btn.setEnabled(False)
@@ -379,3 +405,95 @@ class ConnectionScreen(ScreenBase):
         outer.addWidget(btn)
         outer.addStretch(1)
         return box
+
+
+class ConnectionScreen(ScreenBase):
+    title = "Connection"
+
+    def __init__(self, hub, parent=None):
+        super().__init__(hub, parent)
+
+        self._proof_panel = NucleoContactProofPanel(hub)
+        self._resource_panel = McuResourceTelemetryPanel(hub)
+        self._reset_panel = RestartMcuPanel(hub)
+        self._testpy_panel = TestPyActivationPanel(hub)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.notice_widget)
+        layout.addWidget(self._proof_panel)
+        layout.addWidget(self._resource_panel)
+
+        row = QHBoxLayout()
+        row.addWidget(self._reset_panel)
+        row.addWidget(self._testpy_panel)
+        layout.addLayout(row)
+        layout.addStretch(1)
+
+        # --- back-compat aliases ---------------------------------------------------------------
+        # tests/test_desktop_screens.py asserts on these attribute names directly, and calls
+        # screen._on_proof(status) to exercise the resource strip without a live poller.
+        self._contact_badge = self._proof_panel._contact_badge
+        self._best_proof = self._proof_panel._best_proof
+        self._last_ack = self._proof_panel._last_ack
+        self._imu_age = self._proof_panel._imu_age
+        self._proof_table = self._proof_panel._proof_table
+        self._details = self._proof_panel._details
+
+        self._resource_box = self._resource_panel._resource_box
+        self._resource_badge = self._resource_panel._resource_badge
+        self._cpu_value = self._resource_panel._cpu_value
+        self._heap_value = self._resource_panel._heap_value
+        self._threads_value = self._resource_panel._threads_value
+        self._rx_errors_value = self._resource_panel._rx_errors_value
+        self._rx_errors_spark = self._resource_panel._rx_errors_spark
+        self._crc_errors_value = self._resource_panel._crc_errors_value
+        self._crc_errors_spark = self._resource_panel._crc_errors_spark
+        self._packets_lost_value = self._resource_panel._packets_lost_value
+
+        self._reset_badge = self._reset_panel._reset_badge
+        self._btn_reset = self._reset_panel._btn_reset
+
+        # No watch() of its own: each panel polls itself, and PanelBase.set_active cascades
+        # activation down to them (see graphs.py for the same pattern).
+
+    def _on_proof(self, status):
+        """Back-compat: tests call this directly on the screen to exercise both proof and
+        resource rendering from one canned status dict, without a live poller tick."""
+        self._proof_panel._on_proof(status)
+        self._resource_panel._on_proof(status)
+
+
+COMPONENTS = [
+    Component(
+        id="panel.connection.nucleo_proof",
+        title="Nucleo Contact Proof",
+        factory=NucleoContactProofPanel,
+        category="Connection",
+        duplicable=True,
+        order=0,
+    ),
+    Component(
+        id="panel.connection.mcu_resource_telemetry",
+        title="MCU Resource Telemetry",
+        factory=McuResourceTelemetryPanel,
+        category="Connection",
+        duplicable=True,
+        order=1,
+    ),
+    Component(
+        id="panel.connection.restart_mcu",
+        title="Restart MCU",
+        factory=RestartMcuPanel,
+        category="Connection",
+        duplicable=False,
+        order=2,
+    ),
+    Component(
+        id="panel.connection.testpy_activation",
+        title="test.py Activation",
+        factory=TestPyActivationPanel,
+        category="Connection",
+        duplicable=False,
+        order=3,
+    ),
+]

@@ -70,9 +70,9 @@ class CameraWidget(QWidget):
     """Paints a receiver's latest JPEG into a label, polling on a local timer.
 
     `receiver_fn` is called on every tick and must return a `lib/camera.py` receiver instance
-    (any of `DefaultCameraReceiver`, `RPiCameraReceiver`, `IPCameraReceiver`) or `None`. Nothing
-    here touches the network or blocks — every receiver method used
-    (`get_latest_jpeg_and_seq()`, `get_placeholder_jpeg()`) is an in-memory read guarded by a lock.
+    (either `RPiCameraReceiver` or `IPCameraReceiver`) or `None`. Nothing here touches the network
+    or blocks — every receiver method used (`get_latest_jpeg_and_seq()`, `get_placeholder_jpeg()`)
+    is an in-memory read guarded by a lock.
     """
 
     #: Emitted whenever a new frame or placeholder is painted. Mainly for tests/observability.

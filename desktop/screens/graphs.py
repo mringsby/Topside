@@ -41,7 +41,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from desktop.screens.base import ScreenBase
+from desktop.component import Component
+from desktop.screens.base import PanelBase, ScreenBase
 
 pg.setConfigOptions(antialias=True)
 pg.setConfigOption("background", "#14151d")
@@ -98,19 +99,53 @@ class _GraphPlotWidget(pg.PlotWidget):
         super().leaveEvent(event)
 
 
-class _ChartPanel(QGroupBox):
+def sample_imu(hub):
+    """Replaces GET /api/sensors + GET /api/control/telemetry. Cheap in-memory reads only.
+
+    Module-level so every chart panel can feed itself from the shared "graphs.sample" poller —
+    six panels watching one key share a single timer, which is what makes a chart free to
+    duplicate into as many docks as the operator wants.
+    """
+    last_data = {}
+    if hub.imu is not None:
+        last_data = hub.imu.get_stats().get("last_data") or {}
+    setpoints = {}
+    if hub.control_telem is not None:
+        setpoints = hub.control_telem.get_latest().get("setpoint") or {}
+    return {"imu": last_data, "setpoint": setpoints}
+
+
+class ChartPanel(PanelBase):
     """One rolling time-series chart: main curve, optional setpoint overlay, zero line,
     crosshair readout and a Y-axis min/max lock. Equivalent to one `.graph-card` + its
     `makeChart()` call in graphs.js.
+
+    Self-sufficient: it polls for its own data, so it works both inside `GraphsScreen`'s grid and
+    alone in its own dock. `standalone` adds the per-chart control row that the grid supplies
+    once for all six.
     """
 
-    def __init__(self, key, label, unit, color, has_setpoint, window_sec, parent=None):
-        super().__init__(label, parent)
+    def __init__(
+        self,
+        hub,
+        key,
+        label,
+        unit,
+        color,
+        has_setpoint,
+        window_sec=DEFAULT_WINDOW_SEC,
+        standalone=False,
+        parent=None,
+    ):
+        super().__init__(hub, parent)
+        self.title = label
         self.key = key
         self.label = label
         self.unit = unit
         self.has_setpoint = has_setpoint
         self.window_sec = window_sec
+        self._paused = False
+        self._start = time.monotonic()
 
         self._xs = deque()
         self._ys = deque()
@@ -169,10 +204,61 @@ class _ChartPanel(QGroupBox):
         header.addWidget(self._auto_btn)
         header.addStretch(1)
 
+        box = QGroupBox(label)
+        inner = QVBoxLayout(box)
+        inner.addLayout(header)
+        if standalone:
+            inner.addLayout(self._build_standalone_controls())
+        inner.addWidget(self.plot, 1)
+        inner.addWidget(self._readout)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self.plot, 1)
-        layout.addWidget(self._readout)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(box)
+
+        self.watch("graphs.sample", lambda: sample_imu(self.hub), POLL_MS, self._on_sample)
+
+    def _build_standalone_controls(self):
+        """The subset of the grid's toolbar that makes sense for a single chart in its own dock."""
+        combo = QComboBox()
+        for value, text in WINDOW_OPTIONS:
+            combo.addItem(text, value)
+        combo.setCurrentIndex([v for v, _ in WINDOW_OPTIONS].index(self.window_sec))
+        combo.currentIndexChanged.connect(lambda index: self.set_window(combo.itemData(index)))
+
+        pause = QPushButton("Pause")
+        pause.clicked.connect(
+            lambda: (self.set_paused(not self._paused), pause.setText("Resume" if self._paused else "Pause"))
+        )
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self.clear)
+        reset = QPushButton("Reset Zoom")
+        reset.clicked.connect(self.reset_zoom)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Window:"))
+        row.addWidget(combo)
+        row.addWidget(pause)
+        row.addWidget(clear)
+        row.addWidget(reset)
+        row.addStretch(1)
+        return row
+
+    def set_paused(self, paused):
+        self._paused = bool(paused)
+
+    def _on_sample(self, sample):
+        """One tick of the shared poller, narrowed to this chart's own channel."""
+        if self._paused:
+            return
+        value = sample["imu"].get(self.key, 0)
+        if not isinstance(value, (int, float)) or value != value:  # NaN check
+            value = 0.0
+        setpoint = None
+        if self.has_setpoint:
+            raw = sample["setpoint"].get(self.key)
+            setpoint = float(raw) if isinstance(raw, (int, float)) else None
+        self.add_sample(time.monotonic() - self._start, float(value), setpoint)
 
     # --- data ---------------------------------------------------------------
 
@@ -310,7 +396,7 @@ class GraphsScreen(ScreenBase):
         grid = QGridLayout()
         grid.setSpacing(8)
         for index, (key, label, unit, color, has_setpoint) in enumerate(CHART_DEFS):
-            panel = _ChartPanel(key, label, unit, color, has_setpoint, self._window_sec)
+            panel = ChartPanel(hub, key, label, unit, color, has_setpoint, self._window_sec)
             self._panels[key] = panel
             grid.addWidget(panel, index // 2, index % 2)
 
@@ -352,36 +438,8 @@ class GraphsScreen(ScreenBase):
         layout.addWidget(help_label)
         layout.addLayout(grid, 1)
 
-        self.watch("graphs.sample", self._sample, POLL_MS, self._on_sample)
-
-    # --- data ---------------------------------------------------------------
-
-    def _sample(self):
-        """Replaces GET /api/sensors + GET /api/control/telemetry. Cheap in-memory reads only."""
-        hub = self.hub
-        last_data = {}
-        if hub.imu is not None:
-            last_data = hub.imu.get_stats().get("last_data") or {}
-        setpoints = {}
-        if hub.control_telem is not None:
-            setpoints = hub.control_telem.get_latest().get("setpoint") or {}
-        return {"imu": last_data, "setpoint": setpoints}
-
-    def _on_sample(self, sample):
-        if self._paused:
-            return
-        t = time.monotonic() - self._start
-        imu = sample["imu"]
-        setpoints = sample["setpoint"]
-        for key, panel in self._panels.items():
-            value = imu.get(key, 0)
-            if not isinstance(value, (int, float)) or value != value:  # NaN check
-                value = 0.0
-            setpoint = None
-            if panel.has_setpoint:
-                raw_setpoint = setpoints.get(key)
-                setpoint = float(raw_setpoint) if isinstance(raw_setpoint, (int, float)) else None
-            panel.add_sample(t, float(value), setpoint)
+        # No watch() of its own: each ChartPanel polls itself, and PanelBase.set_active cascades
+        # activation down to them. Six panels on one poller key still share a single timer.
 
     # --- controls -------------------------------------------------------------
 
@@ -393,6 +451,8 @@ class GraphsScreen(ScreenBase):
 
     def _toggle_pause(self):
         self._paused = not self._paused
+        for panel in self._panels.values():
+            panel.set_paused(self._paused)
         self._btn_pause.setText("Resume" if self._paused else "Pause")
 
     def _clear_all(self):
@@ -451,3 +511,28 @@ class GraphsScreen(ScreenBase):
             self.notify(f"Export failed: {exc}")
             return
         self.notify(f"Exported {len(yaw_xs)} samples to {path}")
+
+
+def _chart_factory(key, label, unit, color, has_setpoint):
+    """Component factories take only `hub`, so each chart's fixed config is closed over here."""
+
+    def build(hub):
+        return ChartPanel(hub, key, label, unit, color, has_setpoint, standalone=True)
+
+    return build
+
+
+#: Every chart is independently placeable AND duplicable — nothing here writes to the vehicle,
+#: so two copies of the yaw chart in two windows is harmless. `GraphsScreen` stays registered as
+#: the all-six grid, for the same reason: a read-only screen has no single-instance hazard.
+COMPONENTS = [
+    Component(
+        id=f"panel.graphs.{key}",
+        title=f"{label} chart",
+        factory=_chart_factory(key, label, unit, color, has_setpoint),
+        category="Graphs",
+        duplicable=True,
+        order=index,
+    )
+    for index, (key, label, unit, color, has_setpoint) in enumerate(CHART_DEFS)
+]

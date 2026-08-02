@@ -34,6 +34,7 @@ DEFAULT_PID_SETPOINT_RATES = {axis: 90.0 for axis in ATTITUDE_AXES}
 DEFAULT_CONTROLLER_GAINS = {"master": 1.0, "axes": {axis: 1.0 for axis in CONTROL_AXES}}
 DEFAULT_IP_CAMERA_IP = "10.77.0.4"
 
+_VALID_THEMES = {"dark", "light"}
 VALID_IMU_AXES = {"+yaw", "-yaw", "+pitch", "-pitch", "+roll", "-roll"}
 VALID_ACCEL_AXES = {"+x", "-x", "+y", "-y", "+z", "-z"}
 NAME_PATTERN = re.compile(r"^[\w\s\-\.]+$")
@@ -261,6 +262,17 @@ def load_imu_offset():
     return config_handler.get_section("imu_offset") or dict(_DEFAULT_OFFSET)
 
 
+def load_theme():
+    return (config_handler.get_section("theme") or {}).get("name", "dark")
+
+
+def save_theme(name):
+    if name not in _VALID_THEMES:
+        raise ValueError(f"Unknown theme: {name!r}")
+    config_handler.update_data({"theme": {"name": name}})
+    return name
+
+
 # --- PID config presets -------------------------------------------------------
 # Bare open() rather than JSONDataHandler, matching routes.py. Pre-existing; not fixed here.
 
@@ -345,3 +357,115 @@ def delete_ip_camera_preset(name):
     section["presets"] = presets
     save_ip_camera_config(section)
     return presets
+
+
+# --- workspace layout presets -------------------------------------------------
+# Through JSONDataHandler, unlike pid_configs.json above -- that bare open() is a documented
+# wart, not a pattern to copy.
+
+WORKSPACE_FILE = data_path("workspaces.json")
+workspace_handler = JSONDataHandler(file_path=WORKSPACE_FILE)
+
+#: Rows a whole screen gets in the Classic layout. Their content is tall; anything less and every
+#: one of them opens already scrolling.
+CLASSIC_SCREEN_ROWS = 13
+
+#: The built-in layout: the ten whole screens, each full width, stacked down one workspace.
+#: It is NOT the startup default any more — a workspace starts empty and the operator builds one.
+#: It survives as a named preset for an operator who wants every screen reachable by scrolling,
+#: which is the closest the grid gets to the old tab bar; the grid has no tabs to reproduce it
+#: exactly. Procedural rather than a captured blob, so it stays readable and cannot go stale.
+CLASSIC_PRESET_NAME = "Classic"
+CLASSIC_PRESET = {
+    "version": 2,
+    "windows": [
+        {
+            "components": [
+                {
+                    "id": f"screen.{name}",
+                    "col": 0,
+                    "row": index * CLASSIC_SCREEN_ROWS,
+                    "cols": 12,
+                    "rows": CLASSIC_SCREEN_ROWS,
+                }
+                for index, name in enumerate(
+                    (
+                        "home",
+                        "pilot",
+                        "tooling",
+                        "debug",
+                        "pid_tuning",
+                        "graphs",
+                        "config",
+                        "connection",
+                        "logs",
+                        "ip_camera",
+                    )
+                )
+            ],
+        }
+    ],
+}
+
+
+def _workspace_section(name):
+    """Read a section without logging on a fresh install.
+
+    JSONDataHandler reports a missing file to stdout; workspaces.json legitimately does not exist
+    until the operator saves a layout, and an error line on every first launch is just noise.
+    """
+    # Ask the handler for its path rather than WORKSPACE_FILE, so a test that swaps the handler
+    # for a tmp_path one is still checking the file it actually reads.
+    if not Path(workspace_handler.file_path).exists():
+        return {}
+    return workspace_handler.get_section(name) or {}
+
+
+def load_workspace_presets():
+    """Saved presets plus the built-in Classic, which a user preset may never shadow."""
+    presets = dict(_workspace_section("presets"))
+    presets[CLASSIC_PRESET_NAME] = CLASSIC_PRESET
+    return presets
+
+
+def save_workspace_preset(name, preset):
+    """Returns (ok, message). Refuses invalid names and the reserved Classic name."""
+    name = (name or "").strip()
+    if not name:
+        return False, "Name a layout before saving."
+    if not valid_name(name):
+        return False, "Use letters, numbers, spaces, dots or dashes."
+    if name == CLASSIC_PRESET_NAME:
+        return False, f"{CLASSIC_PRESET_NAME} is built in and cannot be overwritten."
+    presets = dict(_workspace_section("presets"))
+    presets[name] = preset
+    # update_data is a shallow .update(), so the whole section goes back every time.
+    workspace_handler.update_data({"presets": presets})
+    return True, f"Saved {name}."
+
+
+def delete_workspace_preset(name):
+    """Returns (ok, message). None-equivalent for a name that was never saved."""
+    if name == CLASSIC_PRESET_NAME:
+        return False, f"{CLASSIC_PRESET_NAME} is built in and cannot be deleted."
+    presets = dict(_workspace_section("presets"))
+    if name not in presets:
+        return False, f"No saved layout called {name}."
+    del presets[name]
+    workspace_handler.update_data({"presets": presets})
+    return True, f"Deleted {name}."
+
+
+def load_last_workspace():
+    """Name of the layout to restore on launch, or "" for an empty workspace.
+
+    Empty is the default on a fresh install: the operator picks the components they want out of
+    the Components menu and saves the arrangement, rather than being handed ten screens they then
+    have to close.
+    """
+    return _workspace_section("last").get("name", "")
+
+
+def save_last_workspace(name):
+    workspace_handler.update_data({"last": {"name": name}})
+    return name

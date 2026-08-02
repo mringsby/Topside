@@ -1,4 +1,7 @@
 {
+    "theme": {
+        "name": "dark"
+    },
     "imu_offset": {
         "x": 120.0,
         "y": 0.0,
@@ -34,7 +37,7 @@
             "surge": 0.46,
             "sway": 0.5,
             "heave": 0.53,
-            "roll": 0.45,
+            "roll": 0.24,
             "pitch": 0.5,
             "yaw": 1.0
         }
